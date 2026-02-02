@@ -70,6 +70,21 @@
   :type 'list
   :group 'reddigg)
 
+(defcustom reddigg-cookie nil
+  "Cookie string for Reddit.
+Get this from your browser's developer tools after logging into Reddit.
+Look for the Cookie header in any request to old.reddit.com.
+Example: reddit_session=xxx; loid=xxx; ..."
+  :type '(choice (const :tag "No cookie" nil)
+                 (string :tag "Cookie string"))
+  :group 'reddigg)
+
+(defcustom reddigg-user-agent
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:146.0) Gecko/20100101 Firefox/146.0"
+  "User-Agent string for HTTP requests."
+  :type 'string
+  :group 'reddigg)
+
 (defun reddigg--parse-json-buffer ()
   "Read json from buffer."
   (if (fboundp 'json-parse-buffer)
@@ -163,21 +178,38 @@ SCOPE: hour, day, week, year, all."
                                  reddigg--cmt-list-id
                                  children)))
 
+(defun reddigg--build-headers ()
+  "Build HTTP request headers."
+  (let ((headers
+         '(("Accept" . "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+           ("Accept-Language" . "zh-CN,zh;q=0.8,zh-TW;q=0.7,zh-HK;q=0.5,en-US;q=0.3,en;q=0.2")
+           ("Accept-Encoding" . "gzip, deflate")
+           ("Sec-Fetch-Dest" . "document")
+           ("Sec-Fetch-Mode" . "navigate")
+           ("Sec-Fetch-Site" . "none")
+           ("Sec-Fetch-User" . "?1")
+           ("DNT" . "1"))))
+    (when reddigg-cookie
+      (push (cons "Cookie" reddigg-cookie) headers))
+    headers))
+
 (defun reddigg--promise-json (url)
   "Promise a json from URL."
   (promise-new
    (lambda (resolve reject)
-     (url-retrieve (url-encode-url url)
-                   (lambda (status)
-                     (if (plist-get status :error)
-                         (funcall reject (plist-get status :error))
-                       (condition-case ex
-                           (with-current-buffer (current-buffer)
-                             (if (not (url-http-parse-headers))
-                                 (funcall reject (buffer-string))
-                               (goto-char url-http-end-of-headers)  ; Move to the end of headers
-                               (funcall resolve (reddigg--parse-json-buffer))))
-                         (error (funcall reject ex)))))))))
+     (let ((url-user-agent reddigg-user-agent)
+           (url-request-extra-headers (reddigg--build-headers)))
+       (url-retrieve (url-encode-url url)
+                     (lambda (status)
+                       (if (plist-get status :error)
+                           (funcall reject (plist-get status :error))
+                         (condition-case ex
+                             (with-current-buffer (current-buffer)
+                               (if (not (url-http-parse-headers))
+                                   (funcall reject (buffer-string))
+                                 (goto-char url-http-end-of-headers)  ; Move to the end of headers
+                                 (funcall resolve (reddigg--parse-json-buffer))))
+                           (error (funcall reject ex))))))))))
 
 (defvar reddigg--main-buffer "*reddigg-main*"
   "Buffer for main page.")
