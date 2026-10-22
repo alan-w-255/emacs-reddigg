@@ -88,6 +88,13 @@ The server accepts websocket connections from ~reddit.com~ origins only.
 Use ~--origin~ to allow others, ~--repl~ for an interactive prompt, and ~-v~ for debug logs.
 
 If several tabs are connected, the most recently active one is used.
+Tabs announce themselves when they open and when they become visible,
+and hidden tabs stop refreshing their heartbeat, so that is the tab you
+last looked at.
+
+The userscript only ever fetches reddit itself, and it gives up on a
+request after 25 seconds instead of holding the server until its own
+timeout.
 
 * Buffers
 

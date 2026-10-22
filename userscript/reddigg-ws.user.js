@@ -1,14 +1,15 @@
 // ==UserScript==
 // @name         reddigg websocket bridge
 // @namespace    https://github.com/thanhvg/emacs-reddigg
-// @version      0.1.0
-// @description  Bridge between a local Python websocket server (port 1979) and old.reddit.com. The server sends CRUD action requests; this script performs them in the logged-in reddit tab and streams JSON results back.
+// @version      0.2.0
+// @description  Bridge between a local Python websocket server (port 1979) and a logged-in reddit tab. The server sends CRUD action requests; this script performs them in the page and streams JSON results back.
 // @author       reddigg
 // @match        https://old.reddit.com/*
 // @match        https://www.reddit.com/*
 // @match        https://reddit.com/*
 // @grant        none
 // @run-at       document-idle
+// @noframes
 // @connect      127.0.0.1
 // ==/UserScript==
 
@@ -36,13 +37,19 @@
  *     { "id": "<uuid>", "ok": true,  "result": <json> }
  *     { "id": "<uuid>", "ok": false, "error": "message" }
  *
- *   page -> server   (on connect, then every 20s):
+ *   page -> server   (on connect, on becoming visible, then every 20s
+ *                     while the tab is visible):
  *     { "type": "hello", "url": location.href,
- *       "user": <name|null>, "modhash": <modhash|null> }
+ *       "user": <name|null>, "visible": <bool>, "ts": <ms> }
  *
  * The script reconnects automatically with exponential backoff, and
  * queues nothing: requests fail fast if the socket is down so the
  * server can retry/open a tab.
+ *
+ * Requests only ever go to reddit itself and time out on their own,
+ * so the tab can never be used to fetch something else with the
+ * user's cookies, and a stalled request fails here rather than
+ * holding the server until its own timeout.
  *
  * A small floating status pill (bottom-right) shows the connection
  * state at a glance: grey while connecting, green when connected
@@ -59,6 +66,12 @@
   const HELLO_INTERVAL_MS = 20000;
   const RECONNECT_BASE_MS = 1000;
   const RECONNECT_MAX_MS = 30000;
+  // Shorter than the server's 30s default, so a stalled request is
+  // reported by the tab instead of by a generic server timeout.
+  const REQUEST_TIMEOUT_MS = 25000;
+
+  // Requests carry the tab's cookies, so they may only go to reddit.
+  const REDDIT_HOST_RE = /(^|\.)reddit\.com$/i;
 
   // Allow overriding the port via a query string (?reddigg_ws_port=1979)
   // or a userscript storage value, so multiple servers can coexist.
@@ -118,17 +131,84 @@
     return { modhash, user };
   }
 
+  // /api/me.json is the one place the modhash can be read without the
+  // legacy DOM: the new reddit UI renders no `input[name="uh"]`.
+  let sessionFallback = { at: 0, info: null };
+
   /**
-   * Build an absolute old.reddit.com URL from an action `path`.
+   * Like `sessionInfo', but falls back to /api/me.json when the page
+   * does not expose the modhash (www/new reddit, or a tab opened
+   * before logging in).  Failures are cached briefly so a logged-out
+   * tab does not ask on every keystroke.
+   * @returns {Promise<{modhash: (string|null), user: (string|null)}>}
+   */
+  async function sessionInfoAsync() {
+    const s = sessionInfo();
+    if (s.modhash) return s;
+    if (Date.now() - sessionFallback.at < 5000 && sessionFallback.info) {
+      return sessionFallback.info;
+    }
+    try {
+      const me = await jsonGet('/api/me.json');
+      const data = me && me.data;
+      if (data && data.modhash) {
+        sessionFallback = {
+          at: Date.now(),
+          info: { modhash: data.modhash, user: data.name || s.user },
+        };
+        return sessionFallback.info;
+      }
+    } catch (err) {
+      warn('could not read /api/me.json', err);
+    }
+    sessionFallback = { at: Date.now(), info: s };
+    return s;
+  }
+
+  /**
+   * Build an absolute reddit URL from an action `path`, refusing any
+   * other host: these requests ride the tab's cookies.
    * `path` may be absolute ("https://old.reddit.com/...") or a
    * pathname ("/api/vote"); protocol-relative and bare paths are
    * resolved against the current origin.
    */
   function resolveUrl(path) {
-    if (/^https?:\/\//i.test(path)) return path;
-    if (path.startsWith('//')) return location.protocol + path;
-    if (path.startsWith('/')) return location.origin + path;
-    return location.origin + '/' + path;
+    if (typeof path !== 'string' || !path.trim()) {
+      throw new Error('missing request path');
+    }
+    let url;
+    try {
+      if (/^https?:\/\//i.test(path)) url = new URL(path);
+      else if (path.startsWith('//')) url = new URL(location.protocol + path);
+      else url = new URL(path.startsWith('/') ? path : '/' + path, location.origin);
+    } catch (_) {
+      throw new Error(`invalid request path: ${path}`);
+    }
+    if (!REDDIT_HOST_RE.test(url.hostname)) {
+      throw new Error(`refusing to request non-reddit host: ${url.hostname}`);
+    }
+    return url.toString();
+  }
+
+  /**
+   * `fetch` with a hard timeout, so a stalled request fails in the tab
+   * instead of leaving Emacs waiting.
+   */
+  async function fetchWithTimeout(url, options) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    try {
+      return await fetch(url, { ...options, signal: controller.signal });
+    } catch (err) {
+      if (err && err.name === 'AbortError') {
+        throw new Error(
+          `request timed out after ${REQUEST_TIMEOUT_MS / 1000}s: ${url}`
+        );
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   /**
@@ -137,16 +217,23 @@
    */
   async function jsonGet(path) {
     const url = resolveUrl(path);
-    const r = await fetch(url, {
+    const r = await fetchWithTimeout(url, {
       method: 'GET',
       credentials: 'include',
       headers: { Accept: 'application/json' },
+      cache: 'no-store',
     });
     const text = await r.text();
     if (!r.ok) {
       throw new Error(`HTTP ${r.status} for ${url}: ${text.slice(0, 500)}`);
     }
-    return parseMaybeJson(text);
+    const data = parseMaybeJson(text);
+    if (typeof data === 'string') {
+      // A login or block page is HTML; Emacs would choke on it later
+      // with a much less useful JSON parse error.
+      throw new Error(`expected JSON from ${url}, got: ${text.slice(0, 300)}`);
+    }
+    return data;
   }
 
   /**
@@ -166,17 +253,17 @@
     }
 
     if (needModhash) {
-      const { modhash } = sessionInfo();
+      const { modhash } = await sessionInfoAsync();
       if (!modhash) {
         throw new Error(
-          'no CSRF modhash found on the reddit tab (are you logged into old.reddit.com?)'
+          'no CSRF modhash found for this tab (open old.reddit.com while logged in)'
         );
       }
       params.set('uh', modhash);
       if (!params.has('api_type')) params.set('api_type', 'json');
     }
 
-    const r = await fetch(url, {
+    const r = await fetchWithTimeout(url, {
       method: 'POST',
       credentials: 'include',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -228,7 +315,7 @@
   const actions = {
     /** { type:"hello" }-style probe; also usable as a health check. */
     async ping() {
-      const s = sessionInfo();
+      const s = await sessionInfoAsync();
       return {
         url: location.href,
         user: s.user,
@@ -239,10 +326,10 @@
 
     /** Re-scrape {modhash,user} from the page. */
     async session() {
-      const s = sessionInfo();
+      const s = await sessionInfoAsync();
       if (!s.modhash) {
         throw new Error(
-          'no CSRF modhash found on the reddit tab (are you logged into old.reddit.com?)'
+          'no CSRF modhash found for this tab (open old.reddit.com while logged in)'
         );
       }
       return s;
@@ -329,14 +416,19 @@
     return false;
   }
 
-  function sendHello() {
-    const s = sessionInfo();
-    currentUser = s.user || null;
+  async function sendHello() {
+    let info = { modhash: null, user: null };
+    try {
+      info = await sessionInfoAsync();
+    } catch (_) { /* keep the nulls */ }
+    currentUser = info.user || null;
+    // The modhash is deliberately not sent: the server asks for it
+    // with the `session` action when it actually needs one.
     wsSend({
       type: 'hello',
       url: location.href,
-      user: s.user,
-      modhash: s.modhash,
+      user: info.user,
+      visible: !document.hidden,
       ts: Date.now(),
     });
     // Refresh the pill so the user name shows once we know it.
@@ -362,31 +454,46 @@
     }
   }
 
+  function isLiveSocket(ws) {
+    return !!ws && (ws.readyState === WebSocket.OPEN ||
+                    ws.readyState === WebSocket.CONNECTING);
+  }
+
   function connect() {
-    if (closedByUs) {
-      closedByUs = false;
-    }
+    if (isLiveSocket(socket)) return;   // connected or connecting already
+    closedByUs = false;
     clearTimeout(reconnectTimer);
+    reconnectTimer = null;
 
     log(`connecting to ${WS_URL} ...`);
     setStatus('connecting');
+    let ws;
     try {
-      socket = new WebSocket(WS_URL);
+      ws = new WebSocket(WS_URL);
     } catch (err) {
       warn('WebSocket construction failed', err);
       scheduleReconnect();
       return;
     }
+    socket = ws;
 
-    socket.addEventListener('open', () => {
+    // Every handler ignores events from a socket that has already been
+    // replaced, so a reconnect can never mix the two up.
+    ws.addEventListener('open', () => {
+      if (ws !== socket) return;
       log('connected');
       reconnectDelay = RECONNECT_BASE_MS;
       sendHello();
       clearInterval(helloTimer);
-      helloTimer = setInterval(sendHello, HELLO_INTERVAL_MS);
+      helloTimer = setInterval(() => {
+        // A hidden tab stops refreshing its `last_seen`, so the server
+        // prefers the tab the user is actually looking at.
+        if (!document.hidden) sendHello();
+      }, HELLO_INTERVAL_MS);
     });
 
-    socket.addEventListener('message', (ev) => {
+    ws.addEventListener('message', (ev) => {
+      if (ws !== socket) return;
       let msg;
       try {
         msg = JSON.parse(ev.data);
@@ -397,7 +504,9 @@
       handleRequest(msg);
     });
 
-    socket.addEventListener('close', () => {
+    ws.addEventListener('close', () => {
+      if (ws !== socket) return;
+      socket = null;
       log('disconnected');
       currentUser = null;
       clearInterval(helloTimer);
@@ -406,19 +515,36 @@
       scheduleReconnect();
     });
 
-    socket.addEventListener('error', () => {
+    ws.addEventListener('error', () => {
       // `close` always follows, so just log here.
       warn('socket error');
     });
   }
 
-  function scheduleReconnect() {
-    if (closedByUs) return;
+  function disconnect(reason) {
+    closedByUs = true;
+    clearInterval(helloTimer);
+    helloTimer = null;
     clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+    setStatus('off');
+    const ws = socket;
+    socket = null;
+    if (ws) {
+      try { ws.close(); } catch (_) { /* ignore */ }
+    }
+    if (reason) log(`disconnected (${reason})`);
+  }
+
+  function scheduleReconnect() {
+    if (closedByUs || reconnectTimer) return;
+    // Jitter keeps several tabs from reconnecting in lockstep.
+    const delay = Math.round(reconnectDelay * (0.8 + Math.random() * 0.4));
     reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
       connect();
-    }, reconnectDelay);
-    log(`reconnecting in ${reconnectDelay}ms`);
+    }, delay);
+    log(`reconnecting in ${delay}ms`);
     reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX_MS);
   }
 
@@ -489,18 +615,10 @@
     pillEl.appendChild(pillDot);
     pillEl.appendChild(pillLabel);
     pillEl.addEventListener('click', () => {
-      // Toggle: if we have a live socket, close it and stop; otherwise
-      // (re)connect.  closedByUs is reset by connect().
-      if (socket && socket.readyState === WebSocket.OPEN) {
-        closedByUs = true;
-        setStatus('off');
-        clearInterval(helloTimer);
-        clearTimeout(reconnectTimer);
-        try { socket.close(); } catch (_) { /* ignore */ }
-        log('disconnected by user (click to reconnect)');
-      } else {
-        connect();
-      }
+      // Toggle: a live (or still connecting) socket is dropped,
+      // otherwise we (re)connect.
+      if (isLiveSocket(socket)) disconnect('by user');
+      else connect();
     });
 
     document.body.appendChild(pillEl);
@@ -525,14 +643,10 @@
   // Expose a tiny control surface for debugging from the devtools console.
   window.reddiggWS = {
     connect,
-    disconnect() {
-      closedByUs = true;
-      setStatus('off');
-      clearInterval(helloTimer);
-      clearTimeout(reconnectTimer);
-      if (socket) socket.close();
-    },
+    disconnect,
     session: sessionInfo,
+    sessionAsync: sessionInfoAsync,
+    resolveUrl,
     actions,
     setStatus,
     get statusEl() { return pillEl; },
@@ -543,6 +657,27 @@
   // defensive in case the script runs before the DOM is ready.
   if (document.body) buildPill();
   else document.addEventListener('DOMContentLoaded', buildPill, { once: true });
+
+  // A tab that becomes visible again is the one the user is looking
+  // at, so it claims the bridge right away.
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && socket && socket.readyState === WebSocket.OPEN) {
+      sendHello();
+    }
+  });
+
+  // Leaving the page: close the socket so the server unregisters the
+  // tab instead of discovering it when the socket eventually drops.
+  // Coming back from the bfcache: that socket is gone, so reconnect.
+  window.addEventListener('pagehide', () => {
+    if (isLiveSocket(socket)) {
+      closedByUs = true;
+      try { socket.close(); } catch (_) { /* ignore */ }
+    }
+  });
+  window.addEventListener('pageshow', (ev) => {
+    if (ev.persisted) connect();
+  });
 
   connect();
 })();
