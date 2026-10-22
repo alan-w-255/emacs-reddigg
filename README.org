@@ -11,8 +11,8 @@ This package lets you browse Reddit in Emacs org-mode.
 
 It also lets you vote, reply, edit, delete, and submit posts.
 
-Image posts and galleries are downloaded in the background and shown
-inline; see [[*Images][Images]].
+Image posts, galleries and video posters are downloaded in the
+background and shown inline; see [[*Images][Images]] and [[*Videos][Videos]].
 
 Reddit requests now require a logged-in browser session for these actions.
 
@@ -39,6 +39,8 @@ use ~browser-gt~ branch if you prefer it.
   server's dependencies from ~server/pyproject.toml~.
 - A userscript manager such as Tampermonkey or Violentmonkey.
 - A logged-in Reddit session in the browser.
+- Optional: a video player such as ~mpv~ for =reddigg-play-video~, and
+  librsvg for the play badge drawn onto video posters.
 
 * Setup
 
@@ -143,6 +145,14 @@ instances share one server.
 
 ~reddigg-image-timeout~ is how many seconds an image download may take. The default is 30.
 
+~reddigg-video-player~ is the program ~reddigg-play-video~ runs to play a video.
+The default is ~mpv~. Set it to ~nil~ to open videos in a browser instead.
+
+~reddigg-video-player-args~ is a list of extra arguments for that program.
+The default is ~nil~; the arguments are placed before the video URL.
+
+~reddigg-video-poster-badge~ controls whether a play badge is drawn onto inline video posters. The default is ~t~.
+
 * Commands
 
 ~reddigg-view-main~ shows your subreddit list.
@@ -166,6 +176,8 @@ instances share one server.
 ~reddigg-show-images~ downloads and shows the images of the entry at point.
 
 ~reddigg-toggle-images~ shows or hides inline images in the current buffer.
+
+~reddigg-play-video~ plays the video of the entry at point.
 
 ~reddigg-clear-image-cache~ deletes all cached images.
 
@@ -210,6 +222,76 @@ the browser session. Set ~reddigg-image-display~ to ~link~ or ~nil~
 if you do not want reddigg to contact those hosts automatically.
 
 ~reddigg-clear-image-cache~ deletes the cache.
+
+* Videos
+
+Video posts have no image of their own, only a poster frame that
+Reddit computes for them. reddigg shows that poster exactly like an
+image: downloaded in the background, cached, and displayed inline.
+
+The poster is the same Reddit preview used for image posts, so it is
+no wider than ~reddigg-image-max-width~ and costs one small download.
+When no preview is available the small =redditmedia= thumbnail is used.
+
+A play badge is drawn onto the poster, the way [[https://github.com/zevlg/telega.el][telega]] marks its
+videos: a white triangle in a black circle, baked into a small SVG
+file stored next to the cached poster. Org displays that file as a
+single image, so scaling and the inline image commands keep working.
+Set ~reddigg-video-poster-badge~ to ~nil~ to show the plain poster.
+The badge needs librsvg (and Emacs 28 or later); without it reddigg
+falls back to the plain poster.
+
+Below the poster is a play link, with the video length when Reddit
+reports it:
+
+#+begin_example
+[[elisp:(reddigg-play-video)][▶ play video (1:30)]]
+#+end_example
+
+Use these keys in a reddigg buffer:
+
+- ~C-c C-v v~: play the video of the entry at point.
+- ~C-c C-v i~: download and show the poster of the entry at point.
+- ~RET~ or a mouse click on the poster: play the video.
+
+The poster keeps the usual image keys (zoom, rotate), so it stays an
+image you can inspect; only ~RET~ and the click are redirected to the
+player. Right-clicking the poster still opens the poster file itself.
+
+~reddigg-play-video~ hands the video URL to ~reddigg-video-player~
+(~mpv~ by default) and only falls back to ~browse-url~ when that
+program is not installed. The player streams the URL; nothing is
+downloaded before playback starts.
+
+~reddigg-video-player-args~ adds arguments in front of the URL:
+
+#+begin_src emacs-lisp
+(setq reddigg-video-player-args
+      (list "--no-terminal" "--demuxer-readahead-secs=5"))
+#+end_src
+
+The player runs detached, and its error output goes to the
+~*reddigg-video*~ buffer. When it exits with an error, the tail of that
+output is shown in the echo area, so an expired URL, a missing codec or
+a refused connection does not just close the player window silently.
+
+Hosted videos have two streams: an HLS playlist that carries both
+video and sound, and a silent DASH =mp4= fallback. Players get the HLS
+playlist; browsers get the =mp4=, because browsers cannot play an
+=m3u8= through ~browse-url~.
+
+Videos hosted elsewhere (YouTube and friends) have no Reddit stream, so
+the play link passes their own URL to the player.
+
+The entry records what it found in its properties:
+
+#+begin_example
+:REDDIGG_IMAGES: <poster URL>
+:REDDIGG_POSTER: <poster URL>
+:REDDIGG_VIDEO: <HLS playlist, or DASH fallback>
+:REDDIGG_VIDEO_FALLBACK: <DASH fallback>
+:END:
+#+end_example
 
 * Vote
 

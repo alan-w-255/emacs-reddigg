@@ -50,6 +50,56 @@
                                              \"height\":480}]}]}}"
   "A minimal reddit image post.")
 
+(defun reddigg-test--video (post-json)
+  "Return the video plist of the reddit post in POST-JSON."
+  (reddigg--post-video (reddigg--parse-json-string post-json)))
+
+(defconst reddigg-test--video-json
+  "{\"name\":\"t3_test_video\",
+    \"title\":\"A test video\",
+    \"author\":\"tester\",
+    \"subreddit\":\"test\",
+    \"subreddit_name_prefixed\":\"r/test\",
+    \"likes\":null,
+    \"score\":5,
+    \"num_comments\":0,
+    \"created_utc\":1600000000,
+    \"url\":\"https://v.redd.it/abc123\",
+    \"permalink\":\"/r/test/comments/video/a_test_video/\",
+    \"selftext\":\"\",
+    \"post_hint\":\"hosted:video\",
+    \"is_video\":true,
+    \"thumbnail\":\"https://b.thumbs.redditmedia.com/thumb.jpg\",
+    \"media\":{\"reddit_video\":{\"fallback_url\":\"https://v.redd.it/abc123/DASH_480.mp4?source=fallback\",
+                                \"hls_url\":\"https://v.redd.it/abc123/HLSPlaylist.m3u8?a=1&amp;b=2\",
+                                \"duration\":90,
+                                \"width\":854,
+                                \"height\":480,
+                                \"is_gif\":false}},
+    \"preview\":{\"images\":[{\"source\":{\"url\":\"https://preview.redd.it/poster.jpeg?w=1000&amp;s=x\",
+                                       \"width\":1000,
+                                       \"height\":562},
+                            \"resolutions\":[{\"url\":\"https://preview.redd.it/poster.jpeg?w=320&amp;s=1\",
+                                             \"width\":320,
+                                             \"height\":180},
+                                            {\"url\":\"https://preview.redd.it/poster.jpeg?w=640&amp;s=2\",
+                                             \"width\":640,
+                                             \"height\":360}]}]}}"
+  "A minimal reddit video post.")
+
+(defun reddigg-test--video-entry ()
+  "Return an org buffer holding an entry with video properties."
+  (let ((buffer (generate-new-buffer " *reddigg-test-video*")))
+    (with-current-buffer buffer
+      (org-mode)
+      (insert "* A video\n"
+              ":PROPERTIES:\n"
+              ":REDDIGG_VIDEO: HLS-URL\n"
+              ":REDDIGG_VIDEO_FALLBACK: MP4-URL\n"
+              ":END:\n"
+              "body\n"))
+    buffer))
+
 (ert-deftest reddigg-test-image-url-p ()
   (should (reddigg--image-url-p "https://i.redd.it/a.jpg"))
   (should (reddigg--image-url-p
@@ -207,6 +257,259 @@
                                    "[[file:/tmp/reddigg-test-b.png]]\n\n"
                                    "[[view comments]]\n")))))
       (delete-directory reddigg-image-cache-dir t))))
+
+(ert-deftest reddigg-test-post-video ()
+  (let* ((reddigg-image-max-width 400)
+         (video (reddigg--post-video
+                 (reddigg--parse-json-string reddigg-test--video-json))))
+    (should (equal (plist-get video :url)
+                   "https://v.redd.it/abc123/HLSPlaylist.m3u8?a=1&b=2"))
+    (should (equal (plist-get video :hls)
+                   "https://v.redd.it/abc123/HLSPlaylist.m3u8?a=1&b=2"))
+    (should (equal (plist-get video :fallback)
+                   "https://v.redd.it/abc123/DASH_480.mp4?source=fallback"))
+    (should (equal (plist-get video :poster)
+                   "https://preview.redd.it/poster.jpeg?w=640&s=2"))
+    (should (= (plist-get video :duration) 90))
+    (should-not (plist-get video :external)))
+  ;; Image posts have no video.
+  (should-not (reddigg--post-video
+               (reddigg--parse-json-string reddigg-test--post-json))))
+
+(ert-deftest reddigg-test-post-video-streams-and-hosts ()
+  (let ((reddigg-image-max-width 400))
+    ;; Without an HLS playlist the silent DASH stream is all there is.
+    (let ((video (reddigg-test--video
+                  "{\"url\":\"https://v.redd.it/x\",
+                    \"post_hint\":\"hosted:video\",
+                    \"media\":{\"reddit_video\":{\"fallback_url\":\"https://v.redd.it/x/DASH_240.mp4\",
+                                                \"duration\":12}},
+                    \"thumbnail\":\"https://b.thumbs.redditmedia.com/t.jpg\"}")))
+      (should (equal (plist-get video :url)
+                     "https://v.redd.it/x/DASH_240.mp4"))
+      (should-not (plist-get video :hls))
+      ;; A small thumbnail is still better than no poster.
+      (should (equal (plist-get video :poster)
+                     "https://b.thumbs.redditmedia.com/t.jpg")))
+    ;; A crossposted video only carries preview.reddit_video_preview.
+    (let ((video (reddigg-test--video
+                  "{\"url\":\"https://v.redd.it/y\",
+                    \"post_hint\":\"rich:video\",
+                    \"preview\":{\"images\":[{\"source\":{\"url\":\"https://preview.redd.it/y.jpg?w=1\"}}],
+                                  \"reddit_video_preview\":{\"fallback_url\":\"https://v.redd.it/y/DASH_360.mp4\"}}}"))) 
+      (should (equal (plist-get video :url)
+                     "https://v.redd.it/y/DASH_360.mp4")))
+    ;; A video hosted elsewhere plays from its own URL.
+    (let ((video (reddigg-test--video
+                  "{\"url\":\"https://www.youtube.com/watch?v=abc\",
+                    \"post_hint\":\"rich:video\",
+                    \"is_video\":true,
+                    \"preview\":{\"images\":[{\"source\":{\"url\":\"https://preview.redd.it/yt.jpg?w=1\"}}]}}")))
+      (should (equal (plist-get video :url)
+                     "https://www.youtube.com/watch?v=abc"))
+      (should (plist-get video :external)))))
+
+(ert-deftest reddigg-test-post-video-poster-is-an-image ()
+  (let ((reddigg-image-max-width 400))
+    (should (equal (reddigg--post-image-urls
+                    (reddigg--parse-json-string reddigg-test--video-json))
+                   '("https://preview.redd.it/poster.jpeg?w=640&s=2")))))
+
+(ert-deftest reddigg-test-format-duration ()
+  (should (equal (reddigg--format-duration 5) "0:05"))
+  (should (equal (reddigg--format-duration 90) "1:30"))
+  (should (equal (reddigg--format-duration 3672) "1:01:12"))
+  (should-not (reddigg--format-duration nil)))
+
+(ert-deftest reddigg-test-play-badge-svg ()
+  (let ((svg (reddigg--play-badge-svg "poster & friends.jpg" 400 225)))
+    (should (string-match-p
+             "<svg[^>]*width=\"400\" height=\"225\"" svg))
+    (should (string-match-p
+             "xlink:href=\"poster &amp; friends.jpg\"" svg))
+    (should (string-match-p "<circle" svg))
+    (should (string-match-p "<polygon" svg))))
+
+(ert-deftest reddigg-test-poster-badge-file-fallback ()
+  ;; Without librsvg the poster is returned untouched.
+  (cl-letf (((symbol-function 'reddigg--play-badge-supported-p)
+             (lambda () nil)))
+    (should (equal (reddigg--poster-badge-file "/tmp/poster.jpg")
+                   "/tmp/poster.jpg"))))
+
+(ert-deftest reddigg-test-poster-badge-file ()
+  (skip-unless (reddigg--play-badge-supported-p))
+  (let* ((dir (make-temp-file "reddigg-test-cache-" t))
+         (poster (expand-file-name "abc.jpg" dir))
+         (svg (expand-file-name "abc-play.svg" dir)))
+    (unwind-protect
+        (progn
+          (with-temp-file poster (insert "not really a jpeg"))
+          (cl-letf (((symbol-function 'image-size)
+                     (lambda (&rest _) '(320 . 180))))
+            (should (equal (reddigg--poster-badge-file poster) svg)))
+          (should (file-regular-p svg))
+          (with-temp-buffer
+            (insert-file-contents svg)
+            (should (string-match-p "width=\"320\" height=\"180\""
+                                    (buffer-string)))
+            (should (string-match-p "xlink:href=\"abc.jpg\""
+                                    (buffer-string)))))
+      (delete-directory dir t))))
+
+(ert-deftest reddigg-test-fill-images-badges-the-poster ()
+  (let ((reddigg-image-cache-dir (make-temp-file "reddigg-test-cache-" t))
+        (badged nil))
+    (unwind-protect
+        (with-temp-buffer
+          (org-mode)
+          (let ((anchor (copy-marker (point) t))
+                (poster "https://preview.redd.it/poster.jpg"))
+            (cl-letf (((symbol-function 'reddigg--image-download)
+                       (lambda (_url cb) (funcall cb "/tmp/reddigg-test.jpg")))
+                      ((symbol-function 'reddigg--poster-badge-file)
+                       (lambda (file) (push file badged) (concat file ".svg")))
+                      ((symbol-function 'reddigg--image-supported-p)
+                       (lambda (_file) t))
+                      ((symbol-function 'reddigg--image-width) #'ignore)
+                      ((symbol-function 'reddigg--display-inline-images) #'ignore))
+              (reddigg--fill-images
+               (current-buffer) anchor
+               (list poster "https://preview.redd.it/other.jpg")
+               0 #'ignore poster)))
+          ;; Only the poster is badged, and it is shown from the SVG.
+          (should (equal badged '("/tmp/reddigg-test.jpg")))
+          (should (equal (buffer-string)
+                         (concat "[[file:/tmp/reddigg-test.jpg.svg]]\n\n"
+                                 "[[file:/tmp/reddigg-test.jpg]]\n\n"))))
+      (delete-directory reddigg-image-cache-dir t))))
+
+(ert-deftest reddigg-test-render-video-post-link-mode ()
+  (let ((reddigg-image-display 'link)
+        (reddigg-image-max-width 400)
+        (reddigg-image-cache-dir (make-temp-file "reddigg-test-cache-" t)))
+    (unwind-protect
+        (progn
+          (reddigg--print-sub
+           (reddigg-test--post-list reddigg-test--video-json) "test")
+          (with-current-buffer "*reddigg*"
+            (goto-char (point-min))
+            (should (re-search-forward
+                     "^:REDDIGG_IMAGES: https://preview.redd.it/poster.jpeg\\?w=640&s=2$"
+                     nil t))
+            (should (re-search-forward
+                     "^:REDDIGG_POSTER: https://preview.redd.it/poster.jpeg\\?w=640&s=2$"
+                     nil t))
+            (should (re-search-forward
+                     "^:REDDIGG_VIDEO: https://v.redd.it/abc123/HLSPlaylist.m3u8\\?a=1&b=2$"
+                     nil t))
+            (should (re-search-forward
+                     "^:REDDIGG_VIDEO_FALLBACK: https://v.redd.it/abc123/DASH_480.mp4\\?source=fallback$"
+                     nil t))
+            (should (re-search-forward "reddigg-show-images" nil t))
+            (should (re-search-forward "reddigg-play-video" nil t))
+            (should (re-search-forward "▶ play video (1:30)" nil t))
+            (should-not (re-search-forward "\\[\\[file:" nil t))))
+      (when (get-buffer "*reddigg*")
+        (kill-buffer "*reddigg*"))
+      (delete-directory reddigg-image-cache-dir t))))
+
+(ert-deftest reddigg-test-video-command ()
+  (let ((reddigg-video-player-args nil))
+    (should (equal (reddigg--video-command "mpv" "URL")
+                   '("mpv" "URL"))))
+  (let ((reddigg-video-player-args '("--no-terminal" "--hwdec=auto")))
+    (should (equal (reddigg--video-command "mpv" "URL")
+                   '("mpv" "--no-terminal" "--hwdec=auto" "URL")))))
+
+(ert-deftest reddigg-test-play-video-starts-process ()
+  (let ((buffer (reddigg-test--video-entry))
+        (reddigg-video-player "mpv")
+        (reddigg-video-player-args '("--no-terminal"))
+        started)
+    (unwind-protect
+        (with-current-buffer buffer
+          (goto-char (point-max))
+          (cl-letf (((symbol-function 'executable-find)
+                     (lambda (_program) "/opt/homebrew/bin/mpv"))
+                    ((symbol-function 'make-process)
+                     (lambda (&rest args) (setq started args) 'fake-process)))
+            (reddigg-play-video))
+          ;; The resolved program path is used, not the bare name.
+          (should (equal (plist-get started :command)
+                         '("/opt/homebrew/bin/mpv" "--no-terminal" "HLS-URL")))
+          (should (equal (plist-get started :stderr)
+                         (get-buffer reddigg--video-buffer-name)))
+          (should (plist-get started :noquery)))
+      (kill-buffer buffer))))
+
+(ert-deftest reddigg-test-play-video-browser-fallback ()
+  (let ((buffer (reddigg-test--video-entry))
+        (reddigg-video-player nil)
+        opened)
+    (unwind-protect
+        (with-current-buffer buffer
+          (goto-char (point-max))
+          (cl-letf (((symbol-function 'browse-url)
+                     (lambda (url &rest _) (setq opened url))))
+            (reddigg-play-video))
+          ;; A browser gets the mp4, not the HLS playlist.
+          (should (equal opened "MP4-URL")))
+      (kill-buffer buffer))))
+
+(ert-deftest reddigg-test-video-sentinel ()
+  (let ((reddigg-video-player "mpv")
+        (messages nil))
+    ;; A player that exits cleanly says nothing.
+    (cl-letf (((symbol-function 'process-status) (lambda (_process) 'exit))
+              ((symbol-function 'process-exit-status) (lambda (_process) 0))
+              ((symbol-function 'message)
+               (lambda (&rest args) (push (apply #'format args) messages))))
+      (reddigg--video-sentinel 'fake-process "finished\n"))
+    (should-not messages)
+    ;; A player that dies reports its status and stderr.
+    (with-current-buffer (get-buffer-create reddigg--video-buffer-name)
+      (erase-buffer)
+      (insert "[ffmpeg] tls: HTTP error 403\n"))
+    (cl-letf (((symbol-function 'process-status) (lambda (_process) 'exit))
+              ((symbol-function 'process-exit-status) (lambda (_process) 1))
+              ((symbol-function 'message)
+               (lambda (&rest args) (push (apply #'format args) messages))))
+      (reddigg--video-sentinel 'fake-process "exited abnormally with code 1\n"))
+    (should (string-match-p "stopped (1)" (car messages)))
+    (should (string-match-p "403" (car messages)))))
+
+(ert-deftest reddigg-test-video-poster-overlay ()
+  (let ((reddigg-video-poster-badge nil))
+    (with-temp-buffer
+    (insert "body\n")
+    (let ((marker (copy-marker (point) t)))
+      (cl-letf (((symbol-function 'reddigg--image-supported-p)
+                 (lambda (_file) t))
+                ((symbol-function 'reddigg--image-width) #'ignore)
+                ((symbol-function 'reddigg--display-inline-images) #'ignore))
+        (reddigg--insert-inline-image marker "/tmp/poster-play.svg" t)))
+    (let ((overlay (car (seq-filter
+                         (lambda (ov) (overlay-get ov 'reddigg-video-poster))
+                         (overlays-in (point-min) (point-max))))))
+      (should overlay)
+      (should (equal (overlay-get overlay 'help-echo)
+                     "mouse-1, RET: play video"))
+      ;; Org's own preview overlay is the one that puts `image-map' on
+      ;; the image; ours has to win nonetheless.
+      (let ((preview (make-overlay (overlay-start overlay)
+                                   (overlay-end overlay))))
+        (overlay-put preview 'keymap image-map))
+      (goto-char (overlay-start overlay))
+      (should (eq (key-binding (kbd "RET")) 'reddigg-play-video))
+      (should (eq (key-binding (kbd "<return>")) 'reddigg-play-video))
+      (should (eq (key-binding [mouse-1]) 'reddigg-play-video))
+      ;; A short click is translated to mouse-2 by `follow-link'.
+      (should (eq (key-binding [mouse-2]) 'reddigg-play-video))
+      ;; Right click still opens the poster file itself.
+      (should (eq (key-binding [mouse-3]) 'org-find-file-at-mouse))
+      ;; Everything `image-map' offers still works.
+      (should (eq (key-binding (kbd "i r")) 'image-rotate))))))
 
 (ert-deftest reddigg-test-server-url-parts ()
   (let ((reddigg-server-url "http://127.0.0.1:1979/reddigg"))

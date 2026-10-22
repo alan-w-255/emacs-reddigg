@@ -77,6 +77,11 @@
 ;;
 ;; reddigg-show-images: download and show the images of the entry at point.
 ;;
+;; reddigg-play-video: play the video attached to the entry at point.  A
+;; video post's poster is shown inline like an image, with a play badge
+;; baked into it; RET or a mouse click on the poster plays it too.  The
+;; player streams the URL, and its error output goes to *reddigg-video*.
+;;
 ;; reddigg-toggle-images: show or hide inline images in a buffer.
 ;;
 ;; reddigg-clear-image-cache: delete cached images (default
@@ -89,6 +94,7 @@
 ;; C-c C-v x           delete your own post/comment
 ;; C-c C-v i           show the images of the entry at point
 ;; C-c C-v I           toggle inline images in the buffer
+;; C-c C-v v           play the video of the entry at point
 ;; `reddigg-submit-post' creates a new submission.
 
 ;;; Code:
@@ -810,6 +816,34 @@ natural size."
   :type 'number
   :group 'reddigg)
 
+(defcustom reddigg-video-player "mpv"
+  "Program `reddigg-play-video' uses to play a post's video.
+The video URL is passed as the last argument.  Set it to nil to open
+the video in a browser with `browse-url' instead."
+  :type '(choice (const :tag "Browser" nil) (string :tag "Program"))
+  :group 'reddigg)
+
+(defcustom reddigg-video-player-args nil
+  "Extra arguments passed to `reddigg-video-player'.
+They come before the video URL, so a slower, less eager stream looks
+like this:
+
+  (setq reddigg-video-player-args
+        (list \"--no-terminal\" \"--demuxer-readahead-secs=5\"))
+
+Ignored when `reddigg-video-player' is nil."
+  :type '(repeat string)
+  :group 'reddigg)
+
+(defcustom reddigg-video-poster-badge t
+  "Non-nil means draw a play badge onto an inline video poster.
+The badge is baked into a small SVG file next to the cached poster, so
+it costs nothing to redisplay.  Video posters are still shown without
+it when this is nil or when Emacs cannot reference one image from
+another."
+  :type 'boolean
+  :group 'reddigg)
+
 (defconst reddigg--image-url-regexp
   "\\.\\(?:png\\|jpe?g\\|gif\\|webp\\|bmp\\)\\(?:[?#].*\\)?\\'"
   "Regexp matching URLs that point at a bitmap image.")
@@ -854,13 +888,17 @@ never make Emacs fetch something on the user's own machine or LAN."
             (string= host "0.0.0.0")))
     (error t)))
 
-(defun reddigg--image-url-p (url)
-  "Return non-nil when URL is an http(s) link to a bitmap image."
+(defun reddigg--http-url-p (url)
+  "Return non-nil when URL is an http(s) URL reddigg may contact."
   (and (stringp url)
        (let ((case-fold-search t))
          (and (string-match-p "\\`https?://" url)
-              (string-match-p reddigg--image-url-regexp url)
               (not (reddigg--image-host-blocked-p url))))))
+
+(defun reddigg--image-url-p (url)
+  "Return non-nil when URL is an http(s) link to a bitmap image."
+  (and (string-match-p reddigg--image-url-regexp (or url ""))
+       (reddigg--http-url-p url)))
 
 (defun reddigg--preview-entry-width (entry)
   "Return the pixel width recorded in preview ENTRY, or 0."
@@ -930,28 +968,106 @@ never make Emacs fetch something on the user's own machine or LAN."
             (when url (push url urls))))))
     (nreverse urls)))
 
-(defun reddigg--post-image-urls (post &optional depth)
-  "Return a list of image URLs attached to reddit POST.
-Handles direct image links, image previews, galleries and (one level
-of) crossposts.  DEPTH is non-nil when looking at a crosspost parent."
+(defun reddigg--post-thumbnail-url (post)
+  "Return POST's thumbnail URL when it is a real image, or nil.
+Reddit uses the same `thumbnail' field for both URLs and words such
+as `self', `default', `nsfw' or `spoiler'."
+  (let ((thumbnail (reddigg--html-unescape (gethash "thumbnail" post))))
+    (and (reddigg--http-url-p thumbnail)
+         thumbnail)))
+
+(defun reddigg--reddit-video (post)
+  "Return the video object describing POST's video, or nil.
+Reddit repeats the video under `media' and `secure_media'.  A
+crossposted video that has neither only carries
+`preview'/`reddit_video_preview'."
+  (let ((preview (gethash "preview" post))
+        (candidates nil))
+    (dolist (key '("media" "secure_media"))
+      (let* ((media (gethash key post))
+             (video (and (hash-table-p media)
+                         (gethash "reddit_video" media))))
+        (when (hash-table-p video)
+          (push video candidates))))
+    (when (hash-table-p preview)
+      (let ((video (gethash "reddit_video_preview" preview)))
+        (when (hash-table-p video)
+          (setq candidates (append candidates (list video))))))
+    (car candidates)))
+
+(defconst reddigg--external-video-hints '("rich:video" "rich-video" "video")
+  "Reddit `post_hint' values for videos hosted somewhere else.
+YouTube and Vimeo posts, for example, have a preview image but no
+reddit-hosted video stream.")
+
+(defun reddigg--post-video (post)
+  "Return a plist describing the video attached to POST, or nil.
+The plist carries :url (what to play), :hls and :fallback (reddit's
+streams), :external (non-nil for videos hosted elsewhere), :duration
+in seconds and :poster, a frame to show before playing.  :url prefers
+HLS, which is the only stream reddit serves with sound."
+  (when (hash-table-p post)
+    (let* ((hint (gethash "post_hint" post))
+           (video (reddigg--reddit-video post))
+           (url (reddigg--html-unescape (gethash "url" post)))
+           (external (and (not video)
+                          (reddigg--http-url-p url)
+                          (or (eq (gethash "is_video" post) t)
+                              (member hint reddigg--external-video-hints))
+                          url))
+           (hls (and video (reddigg--html-unescape
+                            (gethash "hls_url" video))))
+           (fallback (and video (reddigg--html-unescape
+                                 (gethash "fallback_url" video))))
+           (duration (and video (gethash "duration" video))))
+      (when (or hls fallback external)
+        (list :url (or hls fallback external)
+              :hls hls
+              :fallback fallback
+              :external (and external t)
+              :duration (and (numberp duration) duration)
+              :poster (or (reddigg--post-preview-url post)
+                          (reddigg--post-thumbnail-url post)))))))
+
+(defun reddigg--post-media (post &optional depth)
+  "Return the media attached to reddit POST as a plist.
+:images is the list of image URLs to display, :poster is the frame
+shown for a video post and :video is its `reddigg--post-video' plist.
+A post without media of its own falls back to the post it crossposts,
+unless DEPTH is non-nil."
   (when (hash-table-p post)
     (let* ((hint (gethash "post_hint" post))
            (url (reddigg--html-unescape (gethash "url" post)))
-           (gallery-p (or (gethash "is_gallery" post)
-                          (equal hint "gallery")))
-           (preview-url (reddigg--post-preview-url post)))
-      (or
-       (and gallery-p (reddigg--gallery-image-urls post))
-       (and preview-url
-            (or (equal hint "image")
-                (reddigg--image-url-p url))
-            (list preview-url))
-       (and (reddigg--image-url-p url) (list url))
-       (unless depth
-         (let ((parents (reddigg--seq->list
-                         (gethash "crosspost_parent_list" post))))
-           (when parents
-             (reddigg--post-image-urls (car parents) t))))))))
+           (video (reddigg--post-video post))
+           (poster (plist-get video :poster))
+           (preview-url (reddigg--post-preview-url post))
+           (images
+            (cond
+             ((or (gethash "is_gallery" post) (equal hint "gallery"))
+              (reddigg--gallery-image-urls post))
+             (video (and poster (list poster)))
+             ((and preview-url
+                   (or (equal hint "image")
+                       (reddigg--image-url-p url)))
+              (list preview-url))
+             ((reddigg--image-url-p url)
+              (list url)))))
+      (cond
+       ((or images video)
+        (list :images images :poster poster :video video))
+       (depth nil)
+       (t
+        (let ((parents (reddigg--seq->list
+                        (gethash "crosspost_parent_list" post))))
+          (when parents
+            (reddigg--post-media (car parents) t))))))))
+
+(defun reddigg--post-image-urls (post &optional depth)
+  "Return a list of image URLs attached to reddit POST.
+Handles direct image links, image previews, galleries, video posters
+and (one level of) crossposts.  DEPTH is non-nil when looking at a
+crosspost parent."
+  (plist-get (reddigg--post-media post depth) :images))
 
 (defun reddigg--image-cache-file (url)
   "Return the cached file for URL, or nil if it is not downloaded."
@@ -1112,15 +1228,136 @@ Return nil when the natural width should be used."
                 ("jpeg" 'jpeg)
                 ("gif" 'gif)
                 ("webp" 'webp)
-                ("bmp" 'bmp))))
+                ("bmp" 'bmp)
+                ("svg" 'svg))))
     (and type (image-type-available-p type))))
 
-(defun reddigg--insert-inline-image (marker file)
-  "Insert a previewable org link to image FILE at MARKER."
+;;; Video posters
+;;
+;; A video post has no image of its own, only a frame reddit computes
+;; for it.  That frame is shown exactly like an image, with a play
+;; badge drawn on top: a small SVG that embeds the cached poster and a
+;; white triangle in a black circle, the way telega marks its videos.
+;; Org displays the SVG as one image, so panning, scaling and the
+;; inline image commands keep working on it.
+
+(defconst reddigg--play-link-label "▶ play video"
+  "Description of the link `reddigg--insert-video-link' inserts.")
+
+(defun reddigg--play-badge-supported-p ()
+  "Non-nil when reddigg can draw a play badge onto a poster.
+That needs librsvg and the `:base-uri' image property, which is what
+lets the badge find the poster sitting next to it (Emacs 28 and up)."
+  (and reddigg-video-poster-badge
+       (version<= "28" emacs-version)
+       (image-type-available-p 'svg)))
+
+(defun reddigg--xml-escape (string)
+  "Escape STRING for use in an XML attribute value."
+  (replace-regexp-in-string
+   "[&<>\"]"
+   (lambda (match)
+     (cdr (assq (aref match 0)
+                '((?& . "&amp;") (?< . "&lt;") (?> . "&gt;") (?\" . "&quot;")))))
+   string t t))
+
+(defun reddigg--play-badge-svg (poster width height)
+  "Return SVG drawing POSTER at WIDTH x HEIGHT with a play badge.
+POSTER is the file name of the poster, which lives in the same
+directory as the SVG, so the reference to it stays relative."
+  (let* ((radius (max 12.0 (/ (float (min width height)) 8.0)))
+         (cx (/ width 2.0))
+         (cy (/ height 2.0))
+         (half (/ radius 2.0))
+         (xoff (/ radius 8.0))
+         (left (+ xoff (- cx half)))
+         (right (+ xoff (+ cx half))))
+    (cl-labels ((num (value) (format "%.2f" value))
+                (point (x y) (format "%s,%s" (num x) (num y))))
+      (format (concat "<svg xmlns=\"http://www.w3.org/2000/svg\""
+                      " xmlns:xlink=\"http://www.w3.org/1999/xlink\""
+                      " width=\"%d\" height=\"%d\" viewBox=\"0 0 %d %d\">\n"
+                      "  <image x=\"0\" y=\"0\" width=\"%d\" height=\"%d\""
+                      " preserveAspectRatio=\"xMidYMid slice\""
+                      " xlink:href=\"%s\"/>\n"
+                      "  <circle cx=\"%s\" cy=\"%s\" r=\"%s\""
+                      " fill=\"black\" fill-opacity=\"0.55\"/>\n"
+                      "  <polygon points=\"%s %s %s\""
+                      " fill=\"white\" fill-opacity=\"0.9\"/>\n"
+                      "</svg>\n")
+              width height width height
+              width height
+              (reddigg--xml-escape poster)
+              (num cx) (num cy) (num radius)
+              (point left (- cy half))
+              (point left (+ cy half))
+              (point right cy)))))
+
+(defun reddigg--poster-badge-file (poster)
+  "Return POSTER, or an SVG copy of it with a play badge on top.
+The SVG is written once, next to the cached poster, and is shown by
+org like any other image.  POSTER itself is returned when the badge
+cannot be drawn, so callers always get a displayable file."
+  (if (not (reddigg--play-badge-supported-p))
+      poster
+    (let ((svg (concat (file-name-sans-extension poster) "-play.svg")))
+      (unless (file-regular-p svg)
+        (condition-case err
+            (let* ((size (image-size (create-image poster nil nil) t))
+                   (width (round (car size)))
+                   (height (round (cdr size))))
+              (when (and (> width 0) (> height 0))
+                (with-temp-file svg
+                  (insert (reddigg--play-badge-svg
+                           (file-name-nondirectory poster) width height)))))
+          (error
+           (message "reddigg: could not add a play badge to %s: %s"
+                    poster (error-message-string err)))))
+      (if (file-regular-p svg) svg poster))))
+
+(defvar reddigg-video-poster-map
+  (make-composed-keymap
+   (list (let ((map (make-sparse-keymap)))
+           (define-key map (kbd "RET") #'reddigg-play-video)
+           (define-key map (kbd "<return>") #'reddigg-play-video)
+           ;; A short mouse-1 click is translated to mouse-2 through
+           ;; `follow-link' when `mouse-1-click-follows-link' is on.
+           (define-key map [follow-link] t)
+           (define-key map [mouse-1] #'reddigg-play-video)
+           (define-key map [mouse-2] #'reddigg-play-video)
+           (define-key map [double-mouse-2] #'reddigg-play-video)
+           ;; Keep org's way of opening the poster file itself.
+           (define-key map [mouse-3] #'org-find-file-at-mouse)
+           map)
+         image-map))
+  "Keymap active on an inline video poster.
+RET and a mouse click play the video, mouse-3 opens the poster file,
+and everything else falls through to `image-map', so the usual image
+commands keep working.")
+
+(defun reddigg--add-video-poster-overlay (beg end)
+  "Let the poster link spanning BEG..END play the video when activated.
+The overlay outranks org's link preview overlay -- the one that puts
+`image-map' on the inline image -- so `reddigg-video-poster-map' is
+the keymap Emacs consults above the poster."
+  (let ((overlay (make-overlay beg end)))
+    (overlay-put overlay 'evaporate t)
+    (overlay-put overlay 'priority 1)
+    (overlay-put overlay 'keymap reddigg-video-poster-map)
+    (overlay-put overlay 'help-echo "mouse-1, RET: play video")
+    (overlay-put overlay 'reddigg-video-poster t)
+    overlay))
+
+(defun reddigg--insert-inline-image (marker file &optional video-p)
+  "Insert a previewable org link to image FILE at MARKER.
+When VIDEO-P, FILE is a video poster: a play badge is drawn on it
+first when this Emacs can do that, and the link plays the video on
+RET or mouse-1."
   (let ((buffer (marker-buffer marker)))
     (when (buffer-live-p buffer)
       (with-current-buffer buffer
-        (let ((inhibit-read-only t))
+        (let ((inhibit-read-only t)
+              (file (if video-p (reddigg--poster-badge-file file) file)))
           (save-excursion
             (goto-char marker)
             (let ((start (point))
@@ -1130,7 +1367,11 @@ Return nil when the natural width should be used."
                   (when width
                     (insert (format "#+ATTR_ORG: :width %d\n" width)))))
               (if supported
-                  (insert (format "[[file:%s]]\n\n" (expand-file-name file)))
+                  (let ((link (point)))
+                    (insert (format "[[file:%s]]" (expand-file-name file)))
+                    (when video-p
+                      (reddigg--add-video-poster-overlay link (point)))
+                    (insert "\n\n"))
                 ;; Keep an inert, described link for formats this Emacs
                 ;; cannot render instead of letting org try and fail.
                 (insert (format "[[file:%s][image (%s)]]\n\n"
@@ -1143,25 +1384,30 @@ Return nil when the natural width should be used."
                    (message "reddigg: could not display image: %s"
                             (error-message-string err))))))))))))
 
-(defun reddigg--fill-images (buffer anchor urls generation done)
+(defun reddigg--fill-images (buffer anchor urls generation done &optional poster)
   "Download URLS one at a time, inserting each at ANCHOR in BUFFER.
+POSTER, when non-nil, is the URL among URLS that is a video poster and
+is therefore marked with a play badge.
 GENERATION is BUFFER's render generation when the download started.
 Call DONE after the last URL (or when the buffer has been re-rendered)."
   (if (null urls)
       (funcall done)
-    (reddigg--image-download
-     (car urls)
-     (lambda (file)
-       (if (not (reddigg--image-generation-current-p buffer generation))
-           nil
-         (when (and file (markerp anchor) (marker-buffer anchor))
-           (reddigg--insert-inline-image anchor file))
-         (reddigg--fill-images buffer anchor (cdr urls) generation done))))))
+    (let ((url (car urls)))
+      (reddigg--image-download
+       url
+       (lambda (file)
+         (if (not (reddigg--image-generation-current-p buffer generation))
+             nil
+           (when (and file (markerp anchor) (marker-buffer anchor))
+             (reddigg--insert-inline-image anchor file (equal url poster)))
+           (reddigg--fill-images
+            buffer anchor (cdr urls) generation done poster)))))))
 
-(defun reddigg--schedule-entry-images (id urls anchor)
+(defun reddigg--schedule-entry-images (id urls anchor &optional poster)
   "Download URLS for entry ID and insert them at ANCHOR.
+POSTER is the URL among URLS that is a video poster.
 The actual work starts from a timer so the buffer finishes rendering
-(and enters `org-mode') first; cached files are then inserted at once."
+before `org-mode' is set up; cached files are then inserted at once."
   (let* ((generation reddigg--render-generation)
          (jobs (reddigg--image-jobs-table))
          (key (list id generation))
@@ -1175,7 +1421,8 @@ The actual work starts from a timer so the buffer finishes rendering
              nil
            (reddigg--fill-images
             buffer anchor urls generation
-            (lambda () (puthash key 'done jobs)))))))))
+            (lambda () (puthash key 'done jobs))
+            poster)))))))
 
 (defun reddigg--insert-image-link (urls)
   "Insert the on-demand image link for an entry with image URLS.
@@ -1187,24 +1434,64 @@ only after inserting any text that must stay below the images."
       (insert "[[elisp:(reddigg-show-images)][show image]]\n"))
     (point)))
 
-(defun reddigg--register-image-area (id urls position)
+(defun reddigg--insert-video-link (video)
+  "Insert the play link for VIDEO (see `reddigg--post-video')."
+  (let ((duration (reddigg--format-duration (plist-get video :duration))))
+    (insert (format "[[elisp:(reddigg-play-video)][%s%s]]\n"
+                    reddigg--play-link-label
+                    (if duration (format " (%s)" duration) "")))))
+
+(defun reddigg--insert-media-link (media)
+  "Insert the on-demand image link and the play link for MEDIA.
+Return the position where the images should be inserted, or nil when
+MEDIA has no image."
+  (let ((position (reddigg--insert-image-link (plist-get media :images))))
+    (when (plist-get media :video)
+      (reddigg--insert-video-link (plist-get media :video)))
+    position))
+
+(defun reddigg--insert-media-properties (media)
+  "Insert the org properties that describe MEDIA.
+They let `reddigg-show-images' and `reddigg-play-video' find an
+entry's media again after the buffer has been re-rendered."
+  (let ((images (plist-get media :images))
+        (poster (plist-get media :poster))
+        (video (plist-get media :video)))
+    (when images
+      (insert (format ":REDDIGG_IMAGES: %s\n" (mapconcat #'identity images " "))))
+    (when poster
+      (insert (format ":REDDIGG_POSTER: %s\n" poster)))
+    (when video
+      (insert (format ":REDDIGG_VIDEO: %s\n" (plist-get video :url)))
+      (let ((fallback (and (not (plist-get video :external))
+                           (plist-get video :fallback))))
+        (when (and fallback (not (equal fallback (plist-get video :url))))
+          (insert (format ":REDDIGG_VIDEO_FALLBACK: %s\n" fallback)))))))
+
+(defun reddigg--register-image-area (id urls position &optional poster)
   "Remember POSITION as entry ID's image spot and schedule URLS.
+POSTER is the URL among URLS that is a video poster.
 The marker advances as images are inserted, keeping gallery images in
 order, but stays above text that was inserted before this call."
   (let ((anchor (copy-marker position t)))
     (push (cons id anchor) reddigg--image-anchors)
     (when (eq reddigg-image-display 'inline)
-      (reddigg--schedule-entry-images id urls anchor))
+      (reddigg--schedule-entry-images id urls anchor poster))
     anchor))
 
-(defun reddigg--entry-image-urls ()
-  "Return the image URLs recorded for the reddit entry at point."
+(defun reddigg--entry-property (name)
+  "Return the value of org property NAME for the entry at point, or nil."
   (save-excursion
     (condition-case nil
         (org-back-to-heading t)
       (error nil))
-    (let ((value (org-entry-get (point) "REDDIGG_IMAGES")))
-      (and (stringp value) (split-string value " " t)))))
+    (let ((value (org-entry-get (point) name)))
+      (and (stringp value) (not (string-empty-p value)) value))))
+
+(defun reddigg--entry-image-urls ()
+  "Return the image URLs recorded for the reddit entry at point."
+  (let ((value (reddigg--entry-property "REDDIGG_IMAGES")))
+    (and value (split-string value " " t))))
 
 (defun reddigg--entry-body-end ()
   "Return the position where the current entry's own text ends.
@@ -1219,11 +1506,13 @@ That is the next heading, including a child heading."
 
 ;;;###autoload
 (defun reddigg-show-images ()
-  "Download and display the images attached to the entry at point."
+  "Download and display the images attached to the entry at point.
+For a video entry this displays its poster."
   (interactive)
   (let* ((thing (reddigg--thing-at-point))
          (id (plist-get thing :id))
          (urls (reddigg--entry-image-urls))
+         (poster (reddigg--entry-property "REDDIGG_POSTER"))
          (generation reddigg--render-generation)
          (jobs (reddigg--image-jobs-table))
          (key (list id generation))
@@ -1252,7 +1541,8 @@ That is the next heading, including a child heading."
                 (if (> (length urls) 1) "s" ""))
        (reddigg--fill-images
         (current-buffer) anchor urls generation
-        (lambda () (puthash key 'done jobs)))))))
+        (lambda () (puthash key 'done jobs))
+        poster)))))
 
 ;;;###autoload
 (defun reddigg-toggle-images ()
@@ -1277,6 +1567,97 @@ That is the next heading, including a child heading."
       (dolist (file (directory-files dir t "\\`[^.]"))
         (when (file-regular-p file) (delete-file file)))
       (message "reddigg: image cache cleared"))))
+
+;;; --- Videos ---------------------------------------------------------------
+;;
+;; Reddit serves video as an HLS playlist plus a silent DASH fallback,
+;; so HLS is the stream to hand to a video player.  Browsers are given
+;; the fallback URL instead, because they cannot play an m3u8 through
+;; `browse-url' but do play the mp4.
+;;
+;; The player runs detached and streams: nothing is downloaded by
+;; reddigg.  Only its error output is kept, so a player that dies (an
+;; expired URL, a missing codec) can say why instead of just closing
+;; its window.
+
+(defconst reddigg--video-buffer-name "*reddigg-video*"
+  "Buffer collecting the error output of `reddigg-video-player'.")
+
+(defun reddigg--format-duration (seconds)
+  "Format SECONDS as M:SS or H:MM:SS, or nil when it is unknown."
+  (when (and (numberp seconds) (>= seconds 0))
+    (let* ((total (round seconds))
+           (hours (/ total 3600))
+           (minutes (/ (% total 3600) 60))
+           (rest (% total 60)))
+      (if (> hours 0)
+          (format "%d:%02d:%02d" hours minutes rest)
+        (format "%d:%02d" minutes rest)))))
+
+(defun reddigg--video-command (program url)
+  "Return the command list that plays URL with PROGRAM.
+`reddigg-video-player-args' go in between."
+  (append (list program) reddigg-video-player-args (list url)))
+
+(defun reddigg--video-output ()
+  "Return the tail of the video player's error output, or nil."
+  (let ((buffer (get-buffer reddigg--video-buffer-name)))
+    (when (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (let ((output (string-trim
+                       (buffer-substring-no-properties
+                        (max (point-min) (- (point-max) 500))
+                        (point-max)))))
+          (unless (string-empty-p output)
+            (string-trim (replace-regexp-in-string
+                          "[[:space:]\n]+" " " output))))))))
+
+(defun reddigg--video-sentinel (process _event)
+  "Report why the video player PROCESS stopped, unless it finished well."
+  (when (memq (process-status process) '(exit signal))
+    (let ((status (process-exit-status process)))
+      (unless (and (integerp status) (zerop status))
+        (let ((output (reddigg--video-output)))
+          (message "reddigg: %s stopped (%s)%s"
+                   reddigg-video-player status
+                   (if output (concat ": " output) "")))))))
+
+;;;###autoload
+(defun reddigg-play-video (&optional url)
+  "Play the video attached to the reddigg entry at point.
+The video is played with `reddigg-video-player' (plus
+`reddigg-video-player-args') when that program is installed, and
+opened with `browse-url' otherwise.  The player streams the URL; it
+is never downloaded first.  With URL, play that video instead of the
+one recorded for the entry."
+  (interactive)
+  (let* ((primary (or url (reddigg--entry-property "REDDIGG_VIDEO")))
+         (fallback (or (and (not url)
+                            (reddigg--entry-property
+                             "REDDIGG_VIDEO_FALLBACK"))
+                       primary))
+         (program (and reddigg-video-player
+                       (executable-find reddigg-video-player)))
+         (target (if program primary fallback)))
+    (unless target
+      (user-error "reddigg: this entry has no playable video"))
+    (if (not program)
+        (browse-url target)
+      (let ((errors (get-buffer-create reddigg--video-buffer-name)))
+        (with-current-buffer errors (erase-buffer))
+        (condition-case err
+            (progn
+              (make-process
+               :name "reddigg-video"
+               :buffer nil
+               :stderr errors
+               :noquery t
+               :command (reddigg--video-command program target)
+               :sentinel #'reddigg--video-sentinel)
+              (message "reddigg: playing video with %s" reddigg-video-player))
+          (error
+           (message "reddigg: could not start %s: %s"
+                    reddigg-video-player (error-message-string err))))))))
 
 ;;; --- Voting ---------------------------------------------------------------
 
@@ -1703,6 +2084,7 @@ editable text on reddit (link posts don't)."
     (define-key m (kbd "C-c C-v x") #'reddigg-delete-at-point)
     (define-key m (kbd "C-c C-v i") #'reddigg-show-images)
     (define-key m (kbd "C-c C-v I") #'reddigg-toggle-images)
+    (define-key m (kbd "C-c C-v v") #'reddigg-play-video)
     m)
   "Keymap for reddigg's generated browsing buffers.")
 
@@ -1835,7 +2217,9 @@ after deleting the current line which should be the More button."
        (lambda (it)
          (let* ((my-it (gethash "data" it))
                 (id (gethash "name" my-it))
-                (images (reddigg--post-image-urls my-it)))
+                (media (reddigg--post-media my-it))
+                (images (plist-get media :images))
+                (poster (plist-get media :poster)))
            (insert "* " (gethash "title" my-it) "\n")
            (insert ":PROPERTIES:\n")
            (insert (format ":REDDIGG_ID: %s\n" id))
@@ -1844,9 +2228,7 @@ after deleting the current line which should be the More button."
            (insert (format ":REDDIGG_LIKES: %s\n" (reddigg--likes->string (gethash "likes" my-it))))
            (insert (format ":REDDIGG_SCORE: %s\n" (gethash "score" my-it)))
            (insert (format ":REDDIGG_CREATED: %s\n" (reddigg--format-created (gethash "created_utc" my-it))))
-           (when images
-             (insert (format ":REDDIGG_IMAGES: %s\n"
-                             (mapconcat #'identity images " "))))
+           (reddigg--insert-media-properties media)
            (insert ":END:\n")
            (insert "| " (ht-get my-it "subreddit_name_prefixed") " | ")
            (insert "score: " (format "%s" (gethash "score" my-it) ) " | ")
@@ -1861,11 +2243,11 @@ after deleting the current line which should be the More button."
                (setq end (point-marker))
                (reddigg--sanitize-range begin end)
                (reddigg--mark-body-overlay begin end)))
-           (let ((image-pos (reddigg--insert-image-link images)))
+           (let ((image-pos (reddigg--insert-media-link media)))
              (insert (format "[[elisp:(reddigg--view-comments \"%s\")][view comments]]\n"
                              (ht-get my-it "permalink")))
              (when image-pos
-               (reddigg--register-image-area id images image-pos)))))
+               (reddigg--register-image-area id images image-pos poster)))))
        (ht-get data "children"))
       (let ((after (ht-get data "after")))
         (when after
@@ -1921,11 +2303,13 @@ after deleting the current line which should be the More button."
   "Print the post itself as a level-1 heading, so it's a full reddigg
 entry like any post or comment -- votable, replyable, editable, and
 deletable, same as everything nested under it.
-Return (ID IMAGES IMAGE-POSITION) for `reddigg--print-comments',
+Return (ID IMAGES IMAGE-POSITION POSTER) for `reddigg--print-comments',
 which registers the image area after the comments are inserted."
   (let* ((cmt (ht-get* (aref (ht-get* data "data" "children") 0) "data"))
          (id (ht-get cmt "name"))
-         (images (reddigg--post-image-urls cmt))
+         (media (reddigg--post-media cmt))
+         (images (plist-get media :images))
+         (poster (plist-get media :poster))
          begin end)
     (insert "* " (ht-get cmt "title") "\n")
     (insert ":PROPERTIES:\n")
@@ -1935,9 +2319,7 @@ which registers the image area after the comments are inserted."
     (insert (format ":REDDIGG_LIKES: %s\n" (reddigg--likes->string (ht-get cmt "likes"))))
     (insert (format ":REDDIGG_SCORE: %s\n" (ht-get cmt "score")))
     (insert (format ":REDDIGG_CREATED: %s\n" (reddigg--format-created (ht-get cmt "created_utc"))))
-    (when images
-      (insert (format ":REDDIGG_IMAGES: %s\n"
-                      (mapconcat #'identity images " "))))
+    (reddigg--insert-media-properties media)
     (insert ":END:\n")
     (insert "| " (ht-get cmt "subreddit_name_prefixed") " | ")
     (insert "score: " (format "%s" (ht-get cmt "score")) " | ")
@@ -1951,8 +2333,8 @@ which registers the image area after the comments are inserted."
     (setq end (point-marker))
     (reddigg--sanitize-range begin end)
     (reddigg--mark-body-overlay begin end)
-    (let ((image-pos (reddigg--insert-image-link images)))
-      (list id images image-pos))))
+    (let ((image-pos (reddigg--insert-media-link media)))
+      (list id images image-pos poster))))
 
 (defun reddigg--print-comment-2 (data level)
   "Extrac comment list from DATA and pass it along with LEVEL."
@@ -1969,12 +2351,13 @@ which registers the image area after the comments are inserted."
     (let* ((post (reddigg--print-comment-1 (aref data 0)))
            (post-id (nth 0 post))
            (images (nth 1 post))
-           (image-pos (nth 2 post)))
+           (image-pos (nth 2 post))
+           (poster (nth 3 post)))
       (reddigg--print-comment-2 (aref data 1) "*")
       ;; Register the post's image area now that the comments are in
       ;; place, so images land above them instead of after the last one.
       (when image-pos
-        (reddigg--register-image-area post-id images image-pos))
+        (reddigg--register-image-area post-id images image-pos poster))
       (reddigg--ensure-modes)
       ;; `overview' startup visibility (set by `reddigg--ensure-modes' via
       ;; `org-set-startup-visibility') folds the post's own body along
