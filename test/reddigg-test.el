@@ -208,5 +208,19 @@
                                    "[[view comments]]\n")))))
       (delete-directory reddigg-image-cache-dir t))))
 
+(ert-deftest reddigg-test-server-url-parts ()
+  (let ((reddigg-server-url "http://127.0.0.1:1979/reddigg"))
+    (should (equal (reddigg--server-url-parts) '("127.0.0.1" . 1979))))
+  (let ((reddigg-server-url "http://localhost/reddigg"))
+    (should (equal (reddigg--server-url-parts) '("localhost" . 80))))
+  (let ((reddigg-server-url "https://example.com/reddigg"))
+    (should (equal (reddigg--server-url-parts) '("example.com" . 443)))))
+
+(ert-deftest reddigg-test-server-command-expands-host-and-port ()
+  (let ((reddigg-server-url "http://127.0.0.1:1985/reddigg")
+        (reddigg-server-command '("python" "srv.py" "--host" "%h" "--port" "%p")))
+    (should (equal (reddigg--server-command)
+                   '("python" "srv.py" "--host" "127.0.0.1" "--port" "1985")))))
+
 (provide 'reddigg-test)
 ;;; reddigg-test.el ends here

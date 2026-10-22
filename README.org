@@ -16,7 +16,8 @@ inline; see [[*Images][Images]].
 
 Reddit requests now require a logged-in browser session for these actions.
 
-~reddigg.el~ talks to a small local Python server.
+~reddigg.el~ talks to a small local Python server, which Emacs starts
+automatically as a subprocess.
 
 The server relays each request to a userscript running in your logged-in Reddit tab.
 
@@ -34,20 +35,26 @@ use ~browser-gt~ branch if you prefer it.
 - ~promise~ 1.1 or later.
 - ~ht~ 2.3 or later.
 - ~org~ 9.2 or later.
-- [[https://docs.astral.sh/uv/][uv]], which runs the server and installs its dependencies from ~server/pyproject.toml~.
+- [[https://docs.astral.sh/uv/][uv]] (or an existing =server/.venv=) to install and run the
+  server's dependencies from ~server/pyproject.toml~.
 - A userscript manager such as Tampermonkey or Violentmonkey.
 - A logged-in Reddit session in the browser.
 
 * Setup
 
 1. Install the required Emacs packages.
-2. Start the server: ~cd server && uv run reddigg_server.py~.
-3. Install ~userscript/reddigg-ws.user.js~ in your userscript manager.
-4. Log in to Reddit and open an ~old.reddit.com~ tab.
-5. Allow the connection when the browser prompts for permission.
-6. Check that the toggle button at the bottom right corner shows connected.
-7. Load ~reddigg.el~ in Emacs.
-8. Run ~M-x reddigg-ping~ to check the whole chain.
+2. Install ~userscript/reddigg-ws.user.js~ in your userscript manager.
+3. Log in to Reddit and open an ~old.reddit.com~ tab.
+4. Allow the connection when the browser prompts for permission.
+5. Check that the toggle button at the bottom right corner shows connected.
+6. Load ~reddigg.el~ in Emacs.
+7. Run ~M-x reddigg-ping~ to check the whole chain.
+
+The server starts automatically as an Emacs subprocess on the first
+request; there is no separate server to launch by hand.
+If you want to control it explicitly, use ~M-x reddigg-server-start~
+and ~M-x reddigg-server-stop~.  A server that was already running is
+reused and never stopped by Emacs.
 
 The browser asks for permission because the userscript connects to ~127.0.0.1~.
 
@@ -55,13 +62,16 @@ Choose to always allow it, or the prompt returns on each page load.
 
 The server listens on ~127.0.0.1:1979~ only.
 
-Use ~--port~ to change the port.
+When Emacs starts the server, the port comes from ~reddigg-server-url~;
+if you start the server manually, use ~--port~ and change ~reddigg-server-url~
+to match.
 
 The userscript uses port 1979 unless the page URL has ~?reddigg_ws_port=PORT~.
 
 * Server and userscript
 
-The server creates a secret token in =~/.config/reddigg/token= on first run.
+The server creates a secret token in =~/.config/reddigg/token= on first start
+(normally triggered by Emacs).
 
 ~reddigg.el~ reads it and sends it in the ~X-Bridge-Token~ header.
 
@@ -95,11 +105,31 @@ Enter on a Reddit link to run its Emacs command.
 
 ~reddigg-server-url~ is the server's base URL.
 
-The default is ~http://127.0.0.1:1979/reddigg~. Change it if you use ~--port~.
+The default is ~http://127.0.0.1:1979/reddigg~. Its host and port are
+also passed to the auto-started server, so changing it is all you need
+to do to use another port.
 
 ~reddigg-token-file~ is the path to the server token.
 
 The default follows ~REDDIGG_TOKEN_FILE~, then ~$XDG_CONFIG_HOME/reddigg/token~, then =~/.config/reddigg/token=.
+
+~reddigg-server-autostart~ controls whether Emacs starts the server on
+demand. The default is ~t~. Set it to ~nil~ to run the server yourself.
+
+~reddigg-server-command~ overrides the command used to start the server.
+It is a list of strings run in ~reddigg-server-directory~; ~%h~ and ~%p~
+are replaced with the host and port from ~reddigg-server-url~.
+The default prefers =server/.venv=, then ~uv run~, then ~python3~.
+
+~reddigg-server-directory~ is where ~reddigg_server.py~ lives. The default
+is the =server= directory next to ~reddigg.el~.
+
+~reddigg-server-startup-timeout~ is how many seconds to wait for a newly
+started server to accept connections. The default is 30.
+
+~reddigg-server-stop-on-exit~ stops a server that Emacs started when
+Emacs exits. The default is ~t~. Set it to ~nil~ if several Emacs
+instances share one server.
 
 ~reddigg-request-timeout~ sets how many seconds Emacs waits for one request. The default is 35.
 
@@ -126,6 +156,10 @@ The default follows ~REDDIGG_TOKEN_FILE~, then ~$XDG_CONFIG_HOME/reddigg/token~,
 ~reddigg-submit-post~ starts a new post.
 
 ~reddigg-ping~ checks that the server is up and a Reddit tab is connected.
+
+~reddigg-server-start~ starts the server explicitly and waits until it is ready.
+
+~reddigg-server-stop~ stops the server if Emacs started it.
 
 ~reddigg-refresh-session~ reloads the logged-in username after a login change.
 

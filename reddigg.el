@@ -29,7 +29,11 @@
 ;; relays requests to a reddit tab running the reddigg userscript,
 ;; which is the only thing with the user's real, logged-in session.
 ;; You must:
-;;   1. Run the server:  python3 server/reddigg_server.py
+;;   1. Have the Python dependencies ready (see server/pyproject.toml).
+;;      The server itself is started automatically as an Emacs
+;;      subprocess on the first request; see `reddigg-server-autostart',
+;;      `reddigg-server-start' and `reddigg-server-stop'.  There is no
+;;      separate server to launch by hand.
 ;;   2. Load userscript/reddigg-ws.user.js in your browser and be
 ;;      logged into old.reddit.com there.
 ;; The server listens on a single port (1979) for both the userscript's
@@ -63,6 +67,11 @@
 ;; and show it.
 ;;
 ;; reddigg-ping: check the server and the browser tab are reachable.
+;;
+;; reddigg-server-start: start the relay server explicitly (normally it
+;; starts by itself on the first request; see `reddigg-server-autostart').
+;;
+;; reddigg-server-stop: stop a server that reddigg started.
 ;;
 ;; reddigg-refresh-session: re-read the logged-in username from the tab.
 ;;
@@ -109,7 +118,10 @@
   "Base URL of the reddigg HTTP/REST server.
 The server (see server/reddigg_server.py) relays requests to a reddit
 tab running userscript/reddigg-ws.user.js.  The default matches the
-server's default --port (1979), which serves both REST and websocket."
+server's default --port (1979), which serves both REST and websocket.
+
+When `reddigg-server-autostart' is non-nil, the host and port in this
+URL are also used to start the server."
   :type 'string
   :group 'reddigg)
 
@@ -126,6 +138,47 @@ as the X-Bridge-Token header on every request."
 (defcustom reddigg-request-timeout 35
   "Seconds to wait for a single reddigg HTTP request to complete."
   :type 'number
+  :group 'reddigg)
+
+(defconst reddigg--directory
+  (file-name-directory (or load-file-name buffer-file-name default-directory))
+  "Directory containing reddigg.el.")
+
+(defcustom reddigg-server-directory
+  (expand-file-name "server" reddigg--directory)
+  "Directory containing reddigg_server.py."
+  :type 'directory
+  :group 'reddigg)
+
+(defcustom reddigg-server-autostart t
+  "Whether reddigg starts the relay server automatically.
+When non-nil, the first request starts server/reddigg_server.py as an
+Emacs subprocess and waits for it to accept connections.  Set this to
+nil if you prefer to run the server yourself."
+  :type 'boolean
+  :group 'reddigg)
+
+(defcustom reddigg-server-command nil
+  "Command and arguments used to start the relay server.
+The command runs in `reddigg-server-directory'.  Each element may
+contain \"%h\" and \"%p\", which are replaced with the host and port
+from `reddigg-server-url'.
+
+When nil, reddigg uses the virtualenv in `reddigg-server-directory'
+if it exists, then `uv run', then `python3'."
+  :type '(repeat string)
+  :group 'reddigg)
+
+(defcustom reddigg-server-startup-timeout 30
+  "Seconds to wait for a newly started relay server to accept connections."
+  :type 'number
+  :group 'reddigg)
+
+(defcustom reddigg-server-stop-on-exit t
+  "Whether to stop a server started by reddigg when Emacs exits.
+A server that was already running before reddigg started one is never
+stopped.  Set this to nil if several Emacs instances share a server."
+  :type 'boolean
   :group 'reddigg)
 
 (defvar reddigg--modhash nil
@@ -246,6 +299,180 @@ objects such as (error \"msg\") or (user-error \"msg\")."
 (defvar-local reddigg--cmt-list-id nil
   "ID/name of the current comment list.")
 
+;;; --- server process ------------------------------------------------------
+;;
+;; The Python relay server is normally started on demand as an Emacs
+;; subprocess, so there is no separate "start the server" step.  Emacs
+;; only ever stops a server it started itself; if something is already
+;; listening on the configured port, it is used as-is.
+
+(defconst reddigg--server-buffer-name "*reddigg-server*"
+  "Buffer collecting the output of the relay server process.")
+
+(defvar reddigg--server-process nil
+  "The relay server process started by reddigg, if any.")
+
+(defun reddigg--server-url-parts ()
+  "Return (HOST . PORT) taken from `reddigg-server-url'."
+  (let* ((url (url-generic-parse-url reddigg-server-url))
+         (host (url-host url))
+         (port (url-port url)))
+    (cons (or host "127.0.0.1")
+          (or (and port (> port 0) port)
+              (if (equal (url-type url) "https") 443 80)))))
+
+(defun reddigg--server-host ()
+  "Return the host part of `reddigg-server-url'."
+  (car (reddigg--server-url-parts)))
+
+(defun reddigg--server-port ()
+  "Return the port part of `reddigg-server-url'."
+  (cdr (reddigg--server-url-parts)))
+
+(defun reddigg--server-accepting-p ()
+  "Return non-nil when something accepts connections on the server port."
+  (condition-case nil
+      (let ((proc (open-network-stream "reddigg-probe" nil
+                                       (reddigg--server-host)
+                                       (reddigg--server-port))))
+        (delete-process proc)
+        t)
+    (error nil)))
+
+(defun reddigg--server-default-command ()
+  "Return the default command list for starting the relay server."
+  (let* ((dir (expand-file-name reddigg-server-directory))
+         (script (expand-file-name "reddigg_server.py" dir))
+         (venv-python (expand-file-name
+                       (if (eq system-type 'windows-nt)
+                           "Scripts/python.exe"
+                         "bin/python")
+                       (expand-file-name ".venv" dir))))
+    (cond
+     ((file-executable-p venv-python) (list venv-python script))
+     ((executable-find "uv")
+      (list (executable-find "uv") "run" "reddigg_server.py"))
+     ((executable-find "python3")
+      (list (executable-find "python3") script))
+     (t (error "reddigg: cannot find a Python interpreter to run %s" script)))))
+
+(defun reddigg--server-command ()
+  "Return the command list to start the relay server.
+`reddigg-server-command' is used when non-nil; otherwise a suitable
+interpreter is detected and --host/--port are appended.  In either
+case, \"%h\" and \"%p\" in the elements are expanded."
+  (let* ((host (reddigg--server-host))
+         (port (number-to-string (reddigg--server-port)))
+         (template (or reddigg-server-command
+                       (append (reddigg--server-default-command)
+                               (list "--host" "%h" "--port" "%p"))))
+         (subst (lambda (arg)
+                  (setq arg (replace-regexp-in-string "%p" port arg t t))
+                  (replace-regexp-in-string "%h" host arg t t))))
+    (mapcar subst template)))
+
+(defun reddigg--server-sentinel (proc event)
+  "Handle PROC exiting with EVENT."
+  (when (memq (process-status proc) '(exit signal))
+    (when (eq proc reddigg--server-process)
+      (setq reddigg--server-process nil))
+    (unless (process-get proc 'reddigg-stopping)
+      (message "reddigg: server process exited (%s); see buffer %s"
+               (string-trim event) reddigg--server-buffer-name))))
+
+(defun reddigg--server-wait (proc)
+  "Wait until PROC accepts connections, or signal an error."
+  (let ((deadline (+ (float-time) reddigg-server-startup-timeout)))
+    (while (and (process-live-p proc)
+                (not (reddigg--server-accepting-p))
+                (< (float-time) deadline))
+      (accept-process-output proc 0.1))
+    (cond
+     ((reddigg--server-accepting-p) t)
+     ((not (process-live-p proc))
+      (error "reddigg: server failed to start; see buffer %s"
+             reddigg--server-buffer-name))
+     (t
+      (error "reddigg: server did not start within %s seconds; see buffer %s"
+             reddigg-server-startup-timeout reddigg--server-buffer-name)))))
+
+(defun reddigg--server-start ()
+  "Start the relay server in a subprocess and wait until it is ready."
+  (let ((dir (expand-file-name reddigg-server-directory))
+        (default-directory (expand-file-name reddigg-server-directory)))
+    (unless (file-directory-p dir)
+      (error "reddigg: server directory %s does not exist" dir))
+    (let ((script (expand-file-name "reddigg_server.py" dir)))
+      (unless (or reddigg-server-command (file-readable-p script))
+        (error "reddigg: cannot find %s; set `reddigg-server-directory'" script)))
+    (when (process-live-p reddigg--server-process)
+      (process-put reddigg--server-process 'reddigg-stopping t)
+      (delete-process reddigg--server-process))
+    (let ((buffer (get-buffer-create reddigg--server-buffer-name))
+          (command (reddigg--server-command)))
+      (with-current-buffer buffer
+        (erase-buffer))
+      (setq reddigg--server-process
+            (make-process
+             :name "reddigg-server"
+             :buffer buffer
+             :stderr buffer
+             :command command
+             :connection-type 'pipe
+             :coding 'utf-8-unix
+             :noquery t
+             :sentinel #'reddigg--server-sentinel))
+      (message "reddigg: starting server (%s)" (mapconcat #'identity command " "))
+      (reddigg--server-wait reddigg--server-process))))
+
+(defun reddigg--server-ensure ()
+  "Ensure the relay server is reachable, starting it when allowed.
+Return non-nil when a server is listening.  When
+`reddigg-server-autostart' is nil and no server is running, return nil
+without signalling."
+  (cond
+   ((reddigg--server-accepting-p) t)
+   ((not reddigg-server-autostart) nil)
+   ((and reddigg--server-process (process-live-p reddigg--server-process))
+    (reddigg--server-wait reddigg--server-process))
+   (t (reddigg--server-start))))
+
+(defun reddigg--server-kill-emacs ()
+  "Stop a relay server started by reddigg when Emacs exits."
+  (when (and reddigg-server-stop-on-exit
+             reddigg--server-process
+             (process-live-p reddigg--server-process))
+    (process-put reddigg--server-process 'reddigg-stopping t)
+    (delete-process reddigg--server-process)))
+
+(add-hook 'kill-emacs-hook #'reddigg--server-kill-emacs)
+
+;;;###autoload
+(defun reddigg-server-start ()
+  "Start the reddigg relay server and wait until it accepts requests.
+Normally this happens automatically on the first request; see
+`reddigg-server-autostart'.  Server output goes to the buffer named
+by `reddigg--server-buffer-name'."
+  (interactive)
+  (if (reddigg--server-accepting-p)
+      (message "reddigg: server already running on %s:%s"
+               (reddigg--server-host) (reddigg--server-port))
+    (reddigg--server-start)
+    (message "reddigg: server started on %s:%s"
+             (reddigg--server-host) (reddigg--server-port))))
+
+;;;###autoload
+(defun reddigg-server-stop ()
+  "Stop the reddigg relay server if Emacs started it."
+  (interactive)
+  (if (and reddigg--server-process (process-live-p reddigg--server-process))
+      (progn
+        (process-put reddigg--server-process 'reddigg-stopping t)
+        (delete-process reddigg--server-process)
+        (setq reddigg--server-process nil)
+        (message "reddigg: server stopped"))
+    (message "reddigg: no server process started by reddigg")))
+
 ;;; --- HTTP transport to the local reddigg server --------------------------
 ;;
 ;; All reddit access goes through the local Python server (see
@@ -270,7 +497,7 @@ objects such as (error \"msg\") or (user-error \"msg\")."
   "Return the server auth token read from `reddigg-token-file'."
   (let ((file (expand-file-name reddigg-token-file)))
     (unless (file-readable-p file)
-      (error "reddigg: cannot read token file %s (start the server once to create it)"
+      (error "reddigg: cannot read token file %s (is the server running?  Try M-x reddigg-server-start)"
              file))
     (string-trim
      (with-temp-buffer
@@ -290,41 +517,43 @@ a string carrying the server's message on failure."
   (promise-new
    (lambda (resolve reject)
      (condition-case err
-         (let* ((url-request-method method)
-                (url-request-extra-headers
-                 `(("X-Bridge-Token" . ,(reddigg--token))
-                   ,@(when body '(("Content-Type" . "application/json")))))
-                (url-request-data
-                 (when body (encode-coding-string (json-encode body) 'utf-8)))
-                (buf (url-retrieve-synchronously url t t
-                                                 reddigg-request-timeout)))
-           (if (not buf)
-               (funcall reject
-                        "reddigg: no response from server (is it running, or did the request time out?)")
-             (unwind-protect
-                 (with-current-buffer buf
-                   (goto-char (point-min))
-                   (let* ((status (and (looking-at "HTTP/[0-9.]+ \\([0-9]+\\)")
-                                       (string-to-number (match-string 1))))
-                          ;; The body starts after the blank line that ends
-                          ;; the headers; it is UTF-8 bytes in a unibyte buffer.
-                          (data (and (re-search-forward "\r?\n\r?\n" nil t)
-                                     (condition-case nil
-                                         (reddigg--parse-json-string
-                                          (decode-coding-string
-                                           (buffer-substring-no-properties
-                                            (point) (point-max))
-                                           'utf-8))
-                                       (error nil)))))
-                     (if (and status (>= status 200) (< status 300)
-                              (hash-table-p data))
-                         (funcall resolve (gethash "result" data))
-                       (funcall reject
-                                (or (and (hash-table-p data)
-                                         (gethash "error" data))
-                                    (format "reddigg: HTTP %s from server"
-                                            (or status "?")))))))
-               (kill-buffer buf))))
+         (progn
+           (reddigg--server-ensure)
+           (let* ((url-request-method method)
+                  (url-request-extra-headers
+                   `(("X-Bridge-Token" . ,(reddigg--token))
+                     ,@(when body '(("Content-Type" . "application/json")))))
+                  (url-request-data
+                   (when body (encode-coding-string (json-encode body) 'utf-8)))
+                  (buf (url-retrieve-synchronously url t t
+                                                   reddigg-request-timeout)))
+             (if (not buf)
+                 (funcall reject
+                          "reddigg: no response from server (is it running, or did the request time out?)")
+               (unwind-protect
+                   (with-current-buffer buf
+                     (goto-char (point-min))
+                     (let* ((status (and (looking-at "HTTP/[0-9.]+ \\([0-9]+\\)")
+                                         (string-to-number (match-string 1))))
+                            ;; The body starts after the blank line that ends
+                            ;; the headers; it is UTF-8 bytes in a unibyte buffer.
+                            (data (and (re-search-forward "\r?\n\r?\n" nil t)
+                                       (condition-case nil
+                                           (reddigg--parse-json-string
+                                            (decode-coding-string
+                                             (buffer-substring-no-properties
+                                              (point) (point-max))
+                                             'utf-8))
+                                         (error nil)))))
+                       (if (and status (>= status 200) (< status 300)
+                                (hash-table-p data))
+                           (funcall resolve (gethash "result" data))
+                         (funcall reject
+                                  (or (and (hash-table-p data)
+                                           (gethash "error" data))
+                                      (format "reddigg: HTTP %s from server"
+                                              (or status "?")))))))
+                 (kill-buffer buf)))))
        (error (funcall reject
                        (format "reddigg: request to %s failed: %s"
                                url (error-message-string err))))))))
