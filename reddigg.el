@@ -66,11 +66,20 @@
 ;;
 ;; reddigg-refresh-session: re-read the logged-in username from the tab.
 ;;
+;; reddigg-show-images: download and show the images of the entry at point.
+;;
+;; reddigg-toggle-images: show or hide inline images in a buffer.
+;;
+;; reddigg-clear-image-cache: delete cached images (default
+;; ~/.cache/reddigg/images).
+;;
 ;; * Interaction (in the generated buffers, `reddigg-view-mode')
 ;; C-c C-v u / d / 0   upvote / downvote / clear vote
 ;; C-c C-v r           reply
 ;; C-c C-v e           edit your own post/comment
 ;; C-c C-v x           delete your own post/comment
+;; C-c C-v i           show the images of the entry at point
+;; C-c C-v I           toggle inline images in the buffer
 ;; `reddigg-submit-post' creates a new submission.
 
 ;;; Code:
@@ -84,6 +93,7 @@
 (require 'json)
 (require 'url)
 (require 'url-http)
+(require 'image)
 
 (defgroup reddigg nil
   "Search and read stackoverflow and sisters's sites."
@@ -124,6 +134,21 @@ the server/userscript attaches the modhash to state-changing requests).")
 
 (defvar reddigg--current-user nil
   "Cached logged-in reddit username, scraped from the reddit tab.")
+
+(defvar-local reddigg--render-generation 0
+  "Counter bumped each time a reddigg buffer is fully re-rendered.
+Background image downloads compare it with the value they captured so
+that an image from an old listing cannot be inserted into a new one.")
+
+(defvar-local reddigg--image-anchors nil
+  "Alist of (REDDIT-FULLNAME . MARKER) where an entry's images go.")
+
+(defvar-local reddigg--image-jobs nil
+  "Hash table mapping (FULLNAME GENERATION) to `loading' or `done'.
+It keeps `reddigg-show-images' from scheduling the same entry twice.")
+
+(defvar-local reddigg--images-hidden nil
+  "Non-nil when the user hid inline images in this buffer.")
 
 (defconst reddigg--json-false :reddigg-false
   "Sentinel representing JSON `false', kept distinct from `null'/missing
@@ -193,7 +218,18 @@ objects such as (error \"msg\") or (user-error \"msg\")."
   "Get a bunch of modes up and running."
   (if (equal major-mode 'org-mode)
       (org-set-startup-visibility)
-    (org-mode)
+    ;; `org-mode' kills buffer-local variables.  Preserve the image state
+    ;; gathered while the contents were inserted so background downloads
+    ;; can still find their anchors afterwards.
+    (let ((generation reddigg--render-generation)
+          (anchors reddigg--image-anchors)
+          (jobs reddigg--image-jobs)
+          (hidden reddigg--images-hidden))
+      (org-mode)
+      (setq-local reddigg--render-generation generation
+                  reddigg--image-anchors anchors
+                  reddigg--image-jobs jobs
+                  reddigg--images-hidden hidden))
     (font-lock-flush))
   (visual-line-mode)
   (reddigg-view-mode 1))
@@ -491,6 +527,527 @@ readable timestamp, or \"unknown\" if EPOCH isn't a number."
   (if (numberp epoch)
       (format-time-string "%Y-%m-%d %H:%M:%S" epoch)
     "unknown"))
+
+;;; --- Images ---------------------------------------------------------------
+;;
+;; Reddit image posts carry a direct `url' and/or a `preview' object with
+;; several resolutions.  Galleries carry `gallery_data' plus
+;; `media_metadata'.  We pick a preview no wider than
+;; `reddigg-image-max-width' (the original can be many megabytes),
+;; download it in the background, cache it on disk, and insert an org
+;; file link so `org-display-inline-images' can show it.  Images that
+;; are already cached make no network request.
+
+(defcustom reddigg-image-display 'inline
+  "How reddigg handles images attached to posts.
+`inline' downloads the images in the background and displays them in
+the buffer.  `link' only inserts a \"show image\" link; the image is
+fetched when you activate it or run `reddigg-show-images'.  nil
+inserts neither, but the direct image URL is still shown for link
+posts."
+  :type '(choice (const :tag "Display inline" inline)
+                 (const :tag "On demand" link)
+                 (const :tag "Disabled" nil))
+  :group 'reddigg)
+
+(defcustom reddigg-image-cache-dir
+  (expand-file-name "reddigg/images"
+                    (let ((xdg (getenv "XDG_CACHE_HOME")))
+                      (if (and xdg (not (string-empty-p xdg)))
+                          xdg
+                        (expand-file-name "~/.cache"))))
+  "Directory where downloaded reddit images are cached.
+The name of each file is a hash of its URL, so an image is only
+downloaded once.  Use `reddigg-clear-image-cache' to empty it."
+  :type 'directory
+  :group 'reddigg)
+
+(defcustom reddigg-image-max-width 400
+  "Maximum width, in pixels, of inline images.
+Wider images are scaled down; smaller images keep their natural size.
+This is also used to pick a reasonably sized reddit preview instead of
+fetching the original.  Set to nil to use the original image at its
+natural size."
+  :type '(choice (integer :tag "Pixels") (const :tag "Natural size" nil))
+  :group 'reddigg)
+
+(defcustom reddigg-image-max-size (* 20 1024 1024)
+  "Maximum size in bytes of an image reddigg will download."
+  :type 'integer
+  :group 'reddigg)
+
+(defcustom reddigg-image-timeout 30
+  "Seconds to wait for an image download before giving up."
+  :type 'number
+  :group 'reddigg)
+
+(defconst reddigg--image-url-regexp
+  "\\.\\(?:png\\|jpe?g\\|gif\\|webp\\|bmp\\)\\(?:[?#].*\\)?\\'"
+  "Regexp matching URLs that point at a bitmap image.")
+
+(defconst reddigg--image-file-extensions
+  '("png" "jpg" "jpeg" "gif" "webp" "bmp")
+  "Extensions reddigg uses for cached images.")
+
+(defvar reddigg--image-queue (make-hash-table :test 'equal)
+  "In-flight image downloads, keyed by URL.
+Each value is a list of callbacks waiting for the cached file name.")
+
+(defun reddigg--seq->list (seq)
+  "Return the elements of SEQ as a list, or nil if SEQ is not a sequence."
+  (cond ((vectorp seq) (append seq nil))
+        ((and (listp seq) seq) seq)
+        (t nil)))
+
+(defun reddigg--html-unescape (string)
+  "Undo the HTML escaping reddit applies to preview URLs."
+  (when (stringp string)
+    (let ((s string))
+      (setq s (replace-regexp-in-string "&amp;" "&" s t t))
+      (setq s (replace-regexp-in-string "&#x2F;" "/" s t t))
+      s)))
+
+(defun reddigg--image-host-blocked-p (url)
+  "Non-nil when URL points at localhost or a private network address.
+Post data comes from reddit and is untrusted, so an image URL should
+never make Emacs fetch something on the user's own machine or LAN."
+  (condition-case nil
+      (let ((host (downcase (or (url-host (url-generic-parse-url url)) ""))))
+        (or (string= host "localhost")
+            (string-match-p "\\.localhost\\'" host)
+            (string-match-p "\\`127\\." host)
+            (string-match-p "\\`10\\." host)
+            (string-match-p "\\`192\\.168\\." host)
+            (string-match-p "\\`169\\.254\\." host)
+            (string-match-p "\\`172\\.\\(?:1[6-9]\\|2[0-9]\\|3[01]\\)\\." host)
+            (string= host "[::1]")
+            (string= host "::1")
+            (string= host "0.0.0.0")))
+    (error t)))
+
+(defun reddigg--image-url-p (url)
+  "Return non-nil when URL is an http(s) link to a bitmap image."
+  (and (stringp url)
+       (let ((case-fold-search t))
+         (and (string-match-p "\\`https?://" url)
+              (string-match-p reddigg--image-url-regexp url)
+              (not (reddigg--image-host-blocked-p url))))))
+
+(defun reddigg--preview-entry-width (entry)
+  "Return the pixel width recorded in preview ENTRY, or 0."
+  (let ((width (or (gethash "width" entry) (gethash "x" entry))))
+    (if (numberp width) width 0)))
+
+(defun reddigg--pick-preview (entries max-width)
+  "Pick a preview ENTRY at least MAX-WIDTH wide, else the largest one."
+  (when entries
+    (or (and max-width
+             (seq-find (lambda (entry)
+                         (and (hash-table-p entry)
+                              (>= (reddigg--preview-entry-width entry)
+                                  max-width)))
+                       entries))
+        (car (last entries)))))
+
+(defun reddigg--post-preview-url (post)
+  "Return a preview URL from POST's \"preview\" data, or nil."
+  (let* ((preview (gethash "preview" post))
+         (images (and (hash-table-p preview)
+                      (reddigg--seq->list (gethash "images" preview))))
+         (image (car images))
+         (entries (and (hash-table-p image)
+                       (reddigg--seq->list (gethash "resolutions" image))))
+         (source (and (hash-table-p image) (gethash "source" image)))
+         (max-width (and (numberp reddigg-image-max-width)
+                         reddigg-image-max-width))
+         (chosen (and max-width
+                      (reddigg--pick-preview entries max-width))))
+    (when (hash-table-p image)
+      (reddigg--html-unescape
+       (or (and (hash-table-p chosen) (gethash "url" chosen))
+           (and (hash-table-p source) (gethash "url" source))
+           (let ((last (car (last entries))))
+             (and (hash-table-p last) (gethash "url" last))))))))
+
+(defun reddigg--gallery-preview-url (media)
+  "Return a display URL for gallery media MEDIA, or nil."
+  (let* ((entries (reddigg--seq->list (gethash "p" media)))
+         (source (gethash "s" media))
+         (max-width (and (numberp reddigg-image-max-width)
+                         reddigg-image-max-width))
+         (chosen (and max-width
+                      (reddigg--pick-preview entries max-width))))
+    (reddigg--html-unescape
+     (or (and (hash-table-p chosen) (gethash "u" chosen))
+         (and (hash-table-p source) (gethash "u" source))
+         (let ((last (car (last entries))))
+           (and (hash-table-p last) (gethash "u" last)))))))
+
+(defun reddigg--gallery-image-urls (post)
+  "Return the image URLs of POST's gallery, in gallery order."
+  (let* ((gallery (gethash "gallery_data" post))
+         (items (and (hash-table-p gallery)
+                     (reddigg--seq->list (gethash "items" gallery))))
+         (metadata (gethash "media_metadata" post))
+         urls)
+    (when (hash-table-p metadata)
+      (dolist (item items)
+        (when (hash-table-p item)
+          (let* ((media-id (gethash "media_id" item))
+                 (media (and (stringp media-id)
+                             (gethash media-id metadata)))
+                 (url (and (hash-table-p media)
+                           (reddigg--gallery-preview-url media))))
+            (when url (push url urls))))))
+    (nreverse urls)))
+
+(defun reddigg--post-image-urls (post &optional depth)
+  "Return a list of image URLs attached to reddit POST.
+Handles direct image links, image previews, galleries and (one level
+of) crossposts.  DEPTH is non-nil when looking at a crosspost parent."
+  (when (hash-table-p post)
+    (let* ((hint (gethash "post_hint" post))
+           (url (reddigg--html-unescape (gethash "url" post)))
+           (gallery-p (or (gethash "is_gallery" post)
+                          (equal hint "gallery")))
+           (preview-url (reddigg--post-preview-url post)))
+      (or
+       (and gallery-p (reddigg--gallery-image-urls post))
+       (and preview-url
+            (or (equal hint "image")
+                (reddigg--image-url-p url))
+            (list preview-url))
+       (and (reddigg--image-url-p url) (list url))
+       (unless depth
+         (let ((parents (reddigg--seq->list
+                         (gethash "crosspost_parent_list" post))))
+           (when parents
+             (reddigg--post-image-urls (car parents) t))))))))
+
+(defun reddigg--image-cache-file (url)
+  "Return the cached file for URL, or nil if it is not downloaded."
+  (let ((base (expand-file-name (secure-hash 'sha1 url)
+                                reddigg-image-cache-dir)))
+    (seq-some (lambda (ext)
+                (let ((file (concat base "." ext)))
+                  (and (file-regular-p file)
+                       (> (or (file-attribute-size (file-attributes file)) 0) 0)
+                       file)))
+              reddigg--image-file-extensions)))
+
+(defun reddigg--image-extension-from-data (data)
+  "Return a file extension for image DATA, or nil if DATA is not an image."
+  (cond
+   ((string-prefix-p (unibyte-string #x89 ?P ?N ?G) data) "png")
+   ((string-prefix-p (unibyte-string #xff #xd8 #xff) data) "jpg")
+   ((string-prefix-p (unibyte-string ?G ?I ?F ?8) data) "gif")
+   ((and (>= (length data) 12)
+         (string-prefix-p (unibyte-string ?R ?I ?F ?F) data)
+         (string= (substring data 8 12) "WEBP"))
+    "webp")
+   ((string-prefix-p (unibyte-string ?B ?M) data) "bmp")))
+
+(defun reddigg--save-image-response (url)
+  "Save the image in the current URL response buffer for URL.
+Return the cache file name, or nil when the response is not a usable
+image (error page, too large, unsupported format)."
+  (when (<= (buffer-size) reddigg-image-max-size)
+    (save-excursion
+      (goto-char (point-min))
+      (when (and (looking-at "HTTP/[0-9.]+ 200")
+                 (re-search-forward "\r?\n\r?\n" nil t))
+        (let* ((data (buffer-substring-no-properties (point) (point-max)))
+               (ext (reddigg--image-extension-from-data data)))
+          (when ext
+            (make-directory reddigg-image-cache-dir t)
+            (let ((file (expand-file-name
+                         (concat (secure-hash 'sha1 url) "." ext)
+                         reddigg-image-cache-dir)))
+              (with-temp-buffer
+                (set-buffer-multibyte nil)
+                (insert data)
+                (let ((coding-system-for-write 'no-conversion))
+                  (write-region (point-min) (point-max) file nil 'silent)))
+              file)))))))
+
+(defun reddigg--image-download (url callback)
+  "Download image URL in the background and call CALLBACK with its file.
+CALLBACK receives the cache file name, or nil if the download failed.
+Cached images call CALLBACK immediately, and a URL that is already
+being downloaded only adds CALLBACK to the waiters."
+  (let ((cached (reddigg--image-cache-file url)))
+    (cond
+     (cached (funcall callback cached))
+     ((gethash url reddigg--image-queue)
+      (push callback (gethash url reddigg--image-queue)))
+     (t
+      (puthash url (list callback) reddigg--image-queue)
+      (let* ((finished nil)
+             (response-buffer nil)
+             (timer nil)
+             (complete
+              (lambda (file)
+                (unless finished
+                  (setq finished t)
+                  (when (timerp timer) (cancel-timer timer))
+                  (let ((callbacks (gethash url reddigg--image-queue)))
+                    (remhash url reddigg--image-queue)
+                    (dolist (cb (nreverse callbacks))
+                      (condition-case err
+                          (funcall cb file)
+                        (error
+                         (message "reddigg: image callback failed: %s"
+                                  (error-message-string err))))))))))
+        (setq timer
+              (run-at-time
+               reddigg-image-timeout nil
+               (lambda ()
+                 (when (buffer-live-p response-buffer)
+                   (kill-buffer response-buffer))
+                 (funcall complete nil))))
+        (condition-case err
+            (setq response-buffer
+                  (let ((url-request-extra-headers
+                         '(("Accept" . "image/png,image/jpeg,image/gif,image/webp,image/*;q=0.8")))
+                        (url-user-agent
+                         "reddigg/0.9 (Emacs; +https://github.com/thanhvg/emacs-reddigg)"))
+                    (url-retrieve
+                     url
+                     (lambda (status)
+                       (funcall complete
+                                (and (not (plist-get status :error))
+                                     (buffer-live-p (current-buffer))
+                                     (reddigg--save-image-response url))))
+                     nil t t)))
+          (error
+           (funcall complete nil)
+           (message "reddigg: could not fetch image %s: %s"
+                    url (error-message-string err)))))))))
+
+(defun reddigg--image-width (file)
+  "Return the width to use for FILE, capped to `reddigg-image-max-width'.
+Return nil when the natural width should be used."
+  (when (and (integerp reddigg-image-max-width)
+             (> reddigg-image-max-width 0))
+    (condition-case nil
+        (let* ((image (create-image file nil nil))
+               (size (image-size image t)))
+          (when (and (consp size)
+                     (numberp (car size))
+                     (> (car size) reddigg-image-max-width))
+            reddigg-image-max-width))
+      (error nil))))
+
+(defun reddigg--display-inline-images (&optional beg end)
+  "Display inline images between BEG and END in the current buffer."
+  (when (display-graphic-p)
+    ;; Bind the width variable so the `#+ATTR_ORG: :width' lines inserted
+    ;; by `reddigg--insert-inline-image' are honored even when the user
+    ;; keeps the global default of t (natural size).
+    (let ((org-image-actual-width nil))
+      (funcall (if (fboundp 'org-link-preview-region)
+                   'org-link-preview-region
+                 'org-display-inline-images)
+               nil nil beg end))))
+
+(defun reddigg--clear-inline-images ()
+  "Remove inline image previews from the current buffer."
+  (funcall (if (fboundp 'org-link-preview-clear)
+               'org-link-preview-clear
+             'org-remove-inline-images)))
+
+(defun reddigg--reset-image-state ()
+  "Forget per-render image state after erasing a reddigg buffer."
+  ;; `erase-buffer' can leave zero-length preview overlays behind.
+  (ignore-errors (reddigg--clear-inline-images))
+  (setq reddigg--render-generation (1+ reddigg--render-generation)
+        reddigg--image-anchors nil
+        reddigg--image-jobs (make-hash-table :test 'equal)))
+
+(defun reddigg--image-jobs-table ()
+  "Return the image job table for the current buffer."
+  (or reddigg--image-jobs
+      (setq reddigg--image-jobs (make-hash-table :test 'equal))))
+
+(defun reddigg--image-generation-current-p (buffer generation)
+  "Non-nil when BUFFER is alive and still at GENERATION."
+  (and (buffer-live-p buffer)
+       (with-current-buffer buffer
+         (eql generation reddigg--render-generation))))
+
+(defun reddigg--image-supported-p (file)
+  "Non-nil when this Emacs can display the image in FILE."
+  (let ((type (pcase (downcase (or (file-name-extension file) ""))
+                ("png" 'png)
+                ("jpg" 'jpeg)
+                ("jpeg" 'jpeg)
+                ("gif" 'gif)
+                ("webp" 'webp)
+                ("bmp" 'bmp))))
+    (and type (image-type-available-p type))))
+
+(defun reddigg--insert-inline-image (marker file)
+  "Insert a previewable org link to image FILE at MARKER."
+  (let ((buffer (marker-buffer marker)))
+    (when (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (let ((inhibit-read-only t))
+          (save-excursion
+            (goto-char marker)
+            (let ((start (point))
+                  (supported (reddigg--image-supported-p file)))
+              (when supported
+                (let ((width (reddigg--image-width file)))
+                  (when width
+                    (insert (format "#+ATTR_ORG: :width %d\n" width)))))
+              (if supported
+                  (insert (format "[[file:%s]]\n\n" (expand-file-name file)))
+                ;; Keep an inert, described link for formats this Emacs
+                ;; cannot render instead of letting org try and fail.
+                (insert (format "[[file:%s][image (%s)]]\n\n"
+                                (expand-file-name file)
+                                (or (file-name-extension file) "?"))))
+              (when (and supported (not reddigg--images-hidden))
+                (condition-case err
+                    (reddigg--display-inline-images start (point))
+                  (error
+                   (message "reddigg: could not display image: %s"
+                            (error-message-string err))))))))))))
+
+(defun reddigg--fill-images (buffer anchor urls generation done)
+  "Download URLS one at a time, inserting each at ANCHOR in BUFFER.
+GENERATION is BUFFER's render generation when the download started.
+Call DONE after the last URL (or when the buffer has been re-rendered)."
+  (if (null urls)
+      (funcall done)
+    (reddigg--image-download
+     (car urls)
+     (lambda (file)
+       (if (not (reddigg--image-generation-current-p buffer generation))
+           nil
+         (when (and file (markerp anchor) (marker-buffer anchor))
+           (reddigg--insert-inline-image anchor file))
+         (reddigg--fill-images buffer anchor (cdr urls) generation done))))))
+
+(defun reddigg--schedule-entry-images (id urls anchor)
+  "Download URLS for entry ID and insert them at ANCHOR.
+The actual work starts from a timer so the buffer finishes rendering
+(and enters `org-mode') first; cached files are then inserted at once."
+  (let* ((generation reddigg--render-generation)
+         (jobs (reddigg--image-jobs-table))
+         (key (list id generation))
+         (buffer (current-buffer)))
+    (unless (gethash key jobs)
+      (puthash key 'loading jobs)
+      (run-at-time
+       0 nil
+       (lambda ()
+         (if (not (reddigg--image-generation-current-p buffer generation))
+             nil
+           (reddigg--fill-images
+            buffer anchor urls generation
+            (lambda () (puthash key 'done jobs)))))))))
+
+(defun reddigg--insert-image-link (urls)
+  "Insert the on-demand image link for an entry with image URLS.
+Return the buffer position where the images should be inserted, or
+nil when the entry has no images.  The caller registers the position
+only after inserting any text that must stay below the images."
+  (when urls
+    (when (eq reddigg-image-display 'link)
+      (insert "[[elisp:(reddigg-show-images)][show image]]\n"))
+    (point)))
+
+(defun reddigg--register-image-area (id urls position)
+  "Remember POSITION as entry ID's image spot and schedule URLS.
+The marker advances as images are inserted, keeping gallery images in
+order, but stays above text that was inserted before this call."
+  (let ((anchor (copy-marker position t)))
+    (push (cons id anchor) reddigg--image-anchors)
+    (when (eq reddigg-image-display 'inline)
+      (reddigg--schedule-entry-images id urls anchor))
+    anchor))
+
+(defun reddigg--entry-image-urls ()
+  "Return the image URLs recorded for the reddit entry at point."
+  (save-excursion
+    (condition-case nil
+        (org-back-to-heading t)
+      (error nil))
+    (let ((value (org-entry-get (point) "REDDIGG_IMAGES")))
+      (and (stringp value) (split-string value " " t)))))
+
+(defun reddigg--entry-body-end ()
+  "Return the position where the current entry's own text ends.
+That is the next heading, including a child heading."
+  (save-excursion
+    (org-back-to-heading t)
+    (forward-line 1)
+    (while (and (not (eobp))
+                (not (looking-at-p org-outline-regexp-bol)))
+      (forward-line 1))
+    (point)))
+
+;;;###autoload
+(defun reddigg-show-images ()
+  "Download and display the images attached to the entry at point."
+  (interactive)
+  (let* ((thing (reddigg--thing-at-point))
+         (id (plist-get thing :id))
+         (urls (reddigg--entry-image-urls))
+         (generation reddigg--render-generation)
+         (jobs (reddigg--image-jobs-table))
+         (key (list id generation))
+         (state (gethash key jobs))
+         (anchor (let ((marker (cdr (assoc id reddigg--image-anchors))))
+                   (if (and (markerp marker)
+                            (marker-buffer marker)
+                            (marker-position marker))
+                       marker
+                     (copy-marker (reddigg--entry-body-end) t)))))
+    (unless urls
+      (user-error "reddigg: this entry has no image"))
+    (pcase state
+      ('loading
+       (message "reddigg: images are still loading..."))
+      ('done
+       (setq reddigg--images-hidden nil)
+       (save-excursion
+         (org-back-to-heading t)
+         (reddigg--display-inline-images (point) (reddigg--entry-body-end)))
+       (message "reddigg: images shown"))
+      (_
+       (setq reddigg--images-hidden nil)
+       (puthash key 'loading jobs)
+       (message "reddigg: loading %d image%s..." (length urls)
+                (if (> (length urls) 1) "s" ""))
+       (reddigg--fill-images
+        (current-buffer) anchor urls generation
+        (lambda () (puthash key 'done jobs)))))))
+
+;;;###autoload
+(defun reddigg-toggle-images ()
+  "Toggle inline images in the current reddigg buffer."
+  (interactive)
+  (setq reddigg--images-hidden (not reddigg--images-hidden))
+  (if reddigg--images-hidden
+      (progn
+        (reddigg--clear-inline-images)
+        (message "reddigg: inline images hidden"))
+    (reddigg--display-inline-images)
+    (message "reddigg: inline images shown")))
+
+;;;###autoload
+(defun reddigg-clear-image-cache ()
+  "Delete all images cached in `reddigg-image-cache-dir'."
+  (interactive)
+  (let ((dir (expand-file-name reddigg-image-cache-dir)))
+    (unless (file-directory-p dir)
+      (user-error "reddigg: no image cache at %s" dir))
+    (when (y-or-n-p (format "reddigg: delete all files in %s? " dir))
+      (dolist (file (directory-files dir t "\\`[^.]"))
+        (when (file-regular-p file) (delete-file file)))
+      (message "reddigg: image cache cleared"))))
 
 ;;; --- Voting ---------------------------------------------------------------
 
@@ -915,6 +1472,8 @@ editable text on reddit (link posts don't)."
     (define-key m (kbd "C-c C-v r") #'reddigg-reply-at-point)
     (define-key m (kbd "C-c C-v e") #'reddigg-edit-at-point)
     (define-key m (kbd "C-c C-v x") #'reddigg-delete-at-point)
+    (define-key m (kbd "C-c C-v i") #'reddigg-show-images)
+    (define-key m (kbd "C-c C-v I") #'reddigg-toggle-images)
     m)
   "Keymap for reddigg's generated browsing buffers.")
 
@@ -957,6 +1516,7 @@ after deleting the current line which should be the More button."
       (if append
           (kill-whole-line)
         (erase-buffer)
+        (reddigg--reset-image-state)
         ;; insert header and links
         (insert "#+startup: overview indent\n")
         (insert (format "#+title: %s sorted by %s%s\n"
@@ -1044,15 +1604,20 @@ after deleting the current line which should be the More button."
 
       (seq-do
        (lambda (it)
-         (let ((my-it (gethash "data" it)))
+         (let* ((my-it (gethash "data" it))
+                (id (gethash "name" my-it))
+                (images (reddigg--post-image-urls my-it)))
            (insert "* " (gethash "title" my-it) "\n")
            (insert ":PROPERTIES:\n")
-           (insert (format ":REDDIGG_ID: %s\n" (gethash "name" my-it)))
+           (insert (format ":REDDIGG_ID: %s\n" id))
            (insert (format ":REDDIGG_AUTHOR: %s\n" (gethash "author" my-it)))
            (insert (format ":REDDIGG_SUBREDDIT: %s\n" (gethash "subreddit" my-it)))
            (insert (format ":REDDIGG_LIKES: %s\n" (reddigg--likes->string (gethash "likes" my-it))))
            (insert (format ":REDDIGG_SCORE: %s\n" (gethash "score" my-it)))
            (insert (format ":REDDIGG_CREATED: %s\n" (reddigg--format-created (gethash "created_utc" my-it))))
+           (when images
+             (insert (format ":REDDIGG_IMAGES: %s\n"
+                             (mapconcat #'identity images " "))))
            (insert ":END:\n")
            (insert "| " (ht-get my-it "subreddit_name_prefixed") " | ")
            (insert "score: " (format "%s" (gethash "score" my-it) ) " | ")
@@ -1067,8 +1632,11 @@ after deleting the current line which should be the More button."
                (setq end (point-marker))
                (reddigg--sanitize-range begin end)
                (reddigg--mark-body-overlay begin end)))
-           (insert (format "[[elisp:(reddigg--view-comments \"%s\")][view comments]]\n"
-                           (ht-get my-it "permalink")))))
+           (let ((image-pos (reddigg--insert-image-link images)))
+             (insert (format "[[elisp:(reddigg--view-comments \"%s\")][view comments]]\n"
+                             (ht-get my-it "permalink")))
+             (when image-pos
+               (reddigg--register-image-area id images image-pos)))))
        (ht-get data "children"))
       (let ((after (ht-get data "after")))
         (when after
@@ -1124,16 +1692,23 @@ after deleting the current line which should be the More button."
   "Print the post itself as a level-1 heading, so it's a full reddigg
 entry like any post or comment -- votable, replyable, editable, and
 deletable, same as everything nested under it.
-Return the value of `reddigg--cmt-list-id'."
-  (let ((cmt (ht-get* (aref (ht-get* data "data" "children") 0) "data")) begin end)
+Return (ID IMAGES IMAGE-POSITION) for `reddigg--print-comments',
+which registers the image area after the comments are inserted."
+  (let* ((cmt (ht-get* (aref (ht-get* data "data" "children") 0) "data"))
+         (id (ht-get cmt "name"))
+         (images (reddigg--post-image-urls cmt))
+         begin end)
     (insert "* " (ht-get cmt "title") "\n")
     (insert ":PROPERTIES:\n")
-    (insert (format ":REDDIGG_ID: %s\n" (ht-get cmt "name")))
+    (insert (format ":REDDIGG_ID: %s\n" id))
     (insert (format ":REDDIGG_AUTHOR: %s\n" (ht-get cmt "author")))
     (insert (format ":REDDIGG_SUBREDDIT: %s\n" (ht-get cmt "subreddit")))
     (insert (format ":REDDIGG_LIKES: %s\n" (reddigg--likes->string (ht-get cmt "likes"))))
     (insert (format ":REDDIGG_SCORE: %s\n" (ht-get cmt "score")))
     (insert (format ":REDDIGG_CREATED: %s\n" (reddigg--format-created (ht-get cmt "created_utc"))))
+    (when images
+      (insert (format ":REDDIGG_IMAGES: %s\n"
+                      (mapconcat #'identity images " "))))
     (insert ":END:\n")
     (insert "| " (ht-get cmt "subreddit_name_prefixed") " | ")
     (insert "score: " (format "%s" (ht-get cmt "score")) " | ")
@@ -1147,8 +1722,8 @@ Return the value of `reddigg--cmt-list-id'."
     (setq end (point-marker))
     (reddigg--sanitize-range begin end)
     (reddigg--mark-body-overlay begin end)
-    ;; get value for `reddigg--cmt-list-id'
-    (ht-get cmt "name")))
+    (let ((image-pos (reddigg--insert-image-link images)))
+      (list id images image-pos))))
 
 (defun reddigg--print-comment-2 (data level)
   "Extrac comment list from DATA and pass it along with LEVEL."
@@ -1158,11 +1733,19 @@ Return the value of `reddigg--cmt-list-id'."
   "Print comments DATA to buffer."
   (with-current-buffer (reddigg--get-cmt-buffer)
     (erase-buffer)
+    (reddigg--reset-image-state)
     (insert "#+startup: show2levels indent\n")
     (insert (format "#+title: comments for '%s'\n"
                     (ht-get* (aref (ht-get* (aref data 0) "data" "children") 0) "data" "title")))
-    (let ((post-id (reddigg--print-comment-1 (aref data 0))))
+    (let* ((post (reddigg--print-comment-1 (aref data 0)))
+           (post-id (nth 0 post))
+           (images (nth 1 post))
+           (image-pos (nth 2 post)))
       (reddigg--print-comment-2 (aref data 1) "*")
+      ;; Register the post's image area now that the comments are in
+      ;; place, so images land above them instead of after the last one.
+      (when image-pos
+        (reddigg--register-image-area post-id images image-pos))
       (reddigg--ensure-modes)
       ;; `overview' startup visibility (set by `reddigg--ensure-modes' via
       ;; `org-set-startup-visibility') folds the post's own body along

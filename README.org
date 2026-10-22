@@ -11,6 +11,9 @@ This package lets you browse Reddit in Emacs org-mode.
 
 It also lets you vote, reply, edit, delete, and submit posts.
 
+Image posts and galleries are downloaded in the background and shown
+inline; see [[*Images][Images]].
+
 Reddit requests now require a logged-in browser session for these actions.
 
 ~reddigg.el~ talks to a small local Python server.
@@ -100,6 +103,16 @@ The default follows ~REDDIGG_TOKEN_FILE~, then ~$XDG_CONFIG_HOME/reddigg/token~,
 
 ~reddigg-request-timeout~ sets how many seconds Emacs waits for one request. The default is 35.
 
+~reddigg-image-display~ controls image handling: ~inline~ (the default) downloads and shows images, ~link~ only shows a "show image" button, and ~nil~ disables them.
+
+~reddigg-image-max-width~ is the maximum width in pixels for inline images. The default is 400. Set it to ~nil~ to use the original size.
+
+~reddigg-image-cache-dir~ is where downloaded images are cached. The default is =~/.cache/reddigg/images=.
+
+~reddigg-image-max-size~ is the largest image, in bytes, that reddigg will download. The default is 20 MiB.
+
+~reddigg-image-timeout~ is how many seconds an image download may take. The default is 30.
+
 * Commands
 
 ~reddigg-view-main~ shows your subreddit list.
@@ -116,12 +129,53 @@ The default follows ~REDDIGG_TOKEN_FILE~, then ~$XDG_CONFIG_HOME/reddigg/token~,
 
 ~reddigg-refresh-session~ reloads the logged-in username after a login change.
 
+~reddigg-show-images~ downloads and shows the images of the entry at point.
+
+~reddigg-toggle-images~ shows or hides inline images in the current buffer.
+
+~reddigg-clear-image-cache~ deletes all cached images.
+
 * Read posts
 
 1. Run ~reddigg-view-main~.
 2. Select a subreddit.
 3. Select a post.
 4. Enter on ~view comments~ to open its comments.
+
+* Images
+
+reddigg shows images attached to image posts and galleries, both in
+the post list and in the post at the top of the comments buffer.
+
+By default images are downloaded in the background and displayed
+inline. The download uses a Reddit preview no wider than
+~reddigg-image-max-width~ (default 400 pixels) instead of the
+original, which keeps large photos cheap.
+
+Images are cached in ~reddigg-image-cache-dir~ (default
+=~/.cache/reddigg/images=), so refreshing a listing does not download
+them again. Enter on an image's =file:= link to open it in Emacs.
+
+Use these keys in a reddigg buffer:
+
+- ~C-c C-v i~: download and show the images of the entry at point.
+- ~C-c C-v I~: show or hide inline images in the buffer.
+
+~reddigg-image-display~ controls the automatic behavior:
+
+- ~inline~ (the default): download in the background and show the image.
+- ~link~: show a ~show image~ button; download only when you use it.
+- ~nil~: do not download or show images.
+
+#+begin_src emacs-lisp
+(setq reddigg-image-display 'link)
+#+end_src
+
+Image data comes from Reddit's public preview/image hosts, not from
+the browser session. Set ~reddigg-image-display~ to ~link~ or ~nil~
+if you do not want reddigg to contact those hosts automatically.
+
+~reddigg-clear-image-cache~ deletes the cache.
 
 * Vote
 
@@ -202,3 +256,7 @@ The userscript reads the CSRF token and username from the Reddit page.
 Keep the Reddit tab open and logged in while you use ~reddigg~.
 
 For a complete Reddit client, see [[https://github.com/ahungry/md4rd][md4rd]].
+
+* Tests
+
+The ERT tests live in ~test/reddigg-test.el~. They need ~promise~, ~ht~, and ~dash~ on ~load-path~; the file's commentary has the command to run them.
