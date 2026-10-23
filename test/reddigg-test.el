@@ -114,6 +114,57 @@
   (should-not (reddigg--image-url-p "http://172.20.0.1/a.jpg"))
   (should-not (reddigg--image-url-p nil)))
 
+(ert-deftest reddigg-test-reddit-post-url-p ()
+  (should (reddigg-reddit-post-url-p
+           "https://www.reddit.com/r/emacs/comments/lfww57/a_title/"))
+  (should (reddigg-reddit-post-url-p
+           "https://old.reddit.com/r/emacs/comments/lfww57/a_title/?utm_source=share"))
+  (should (reddigg-reddit-post-url-p "https://reddit.com/comments/lfww57"))
+  (should (reddigg-reddit-post-url-p "http://np.reddit.com/r/emacs/comments/lfww57/"))
+  (should (reddigg-reddit-post-url-p "https://redd.it/lfww57"))
+  (should-not (reddigg-reddit-post-url-p "https://www.reddit.com/r/emacs/"))
+  (should-not (reddigg-reddit-post-url-p "https://www.reddit.com/user/foo"))
+  (should-not (reddigg-reddit-post-url-p
+               "https://example.com/r/emacs/comments/lfww57/"))
+  (should-not (reddigg-reddit-post-url-p
+               "https://reddit.com.evil.example/r/emacs/comments/lfww57/"))
+  (should-not (reddigg-reddit-post-url-p nil)))
+
+(ert-deftest reddigg-test-normalize-cmt-path ()
+  (should (equal (reddigg--normalize-cmt-path
+                  "https://www.reddit.com/r/emacs/comments/lfww57/a_title/?utm_source=share")
+                 "r/emacs/comments/lfww57/a_title"))
+  (should (equal (reddigg--normalize-cmt-path
+                  "https://old.reddit.com/r/emacs/comments/lfww57/a_title/")
+                 "r/emacs/comments/lfww57/a_title"))
+  (should (equal (reddigg--normalize-cmt-path
+                  "https://reddit.com/comments/lfww57")
+                 "comments/lfww57"))
+  (should (equal (reddigg--normalize-cmt-path "https://redd.it/lfww57")
+                 "comments/lfww57"))
+  (should (equal (reddigg--normalize-cmt-path
+                  "r/emacs/comments/lfww57/weekly_tipstricketc_thread/")
+                 "r/emacs/comments/lfww57/weekly_tipstricketc_thread"))
+  (should (equal (reddigg--normalize-cmt-path
+                  "/r/emacs/comments/lfww57/a_title.json?sort=top")
+                 "r/emacs/comments/lfww57/a_title")))
+
+(ert-deftest reddigg-test-browse-url-handler-registered ()
+  (require 'browse-url)
+  (let ((pair (seq-find (lambda (entry)
+                          (eq (cdr entry) #'reddigg-open-url))
+                        browse-url-handlers)))
+    (should pair)
+    (should (string-match-p
+             (car pair)
+             "https://www.reddit.com/r/emacs/comments/lfww57/a_title/"))
+    (should-not (string-match-p (car pair) "https://www.reddit.com/r/emacs/"))))
+
+(ert-deftest reddigg-test-open-url-rejects-non-post ()
+  (should-error (reddigg-open-url "https://www.reddit.com/r/emacs/")
+                :type 'user-error)
+  (should-error (reddigg-open-url nil) :type 'user-error))
+
 (ert-deftest reddigg-test-html-unescape ()
   (should (equal (reddigg--html-unescape "a&amp;b") "a&b"))
   (should (equal (reddigg--html-unescape "a&#x2F;b") "a/b"))

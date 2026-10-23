@@ -66,6 +66,12 @@
 ;; https://old.reddit.com/r/emacs/comments/lfww57/weekly_tipstricketc_thread/)
 ;; and show it.
 ;;
+;; reddigg-open-url: open a full reddit post link (including a
+;; https://redd.it/ID share link) in the comments buffer.  It is
+;; registered in `browse-url-handlers', so reddit post links in org
+;; buffers, eww and anything else that goes through `browse-url' open
+;; in reddigg instead of a web browser.
+;;
 ;; reddigg-ping: check the server and the browser tab are reachable.
 ;;
 ;; reddigg-server-start: start the relay server explicitly (normally it
@@ -109,6 +115,8 @@
 (require 'url)
 (require 'url-http)
 (require 'image)
+
+(defvar browse-url-handlers)            ; defined in browse-url.el
 
 (defgroup reddigg nil
   "Search and read stackoverflow and sisters's sites."
@@ -603,17 +611,50 @@ SCOPE: hour, day, week, year, all."
     (when before
       (concat "&before=" before)))))
 
+(defconst reddigg--reddit-post-url-regexp
+  (concat "\\`https?://"
+          "\\(?:"
+          ;; redd.it/<id> short share links
+          "redd\\.it/[[:alnum:]]+"
+          "\\|"
+          ;; [www.|old.|np.]reddit.com[/r/<sub>]/comments/<id>
+          "\\(?:[[:alnum:]-]+\\.\\)*reddit\\.com/"
+          "\\(?:r/[^/?#]+/\\)?comments/[[:alnum:]]+"
+          "\\)"
+          "\\(?:[/?#]\\|\\'\\)")
+  "Regexp matching an http(s) URL that points at a reddit post.
+It matches comment permalinks under reddit.com, with or without a
+subreddit (/r/emacs/comments/ID/... or /comments/ID/...), and
+redd.it share links.  The regexp is anchored at \\=` so it can be
+used as a key in `browse-url-handlers'.
+
+Keep it in sync with the literal copy in the `;;;###autoload' form
+at the end of this file, which `browse-url' may see before reddigg
+itself is loaded.")
+
+(defun reddigg-reddit-post-url-p (url)
+  "Return non-nil when URL is an http(s) link to a reddit post."
+  (and (stringp url)
+       (string-match-p reddigg--reddit-post-url-regexp url)))
+
 (defun reddigg--normalize-cmt-path (cmt)
   "Reduce CMT to a bare path such as \"r/emacs/comments/abc/title\".
-CMT may be a full reddit URL, a permalink with leading/trailing
-slashes (as reddit returns them), or an already-bare path.  The
-leading slash matters: the server resolves the path against the
-reddit origin, so a stray \"//\" would be read as a host."
-  (let* ((p (replace-regexp-in-string "\\`https?://[^/]+/" "" cmt))
-         (p (replace-regexp-in-string "[?#].*\\'" "" p))
-         (p (replace-regexp-in-string "\\`/+\\|/+\\'" "" p))
-         (p (replace-regexp-in-string "\\.json\\'" "" p)))
-    p))
+CMT may be a full reddit URL, a redd.it share link, a permalink with
+leading/trailing slashes (as reddit returns them), or an already-bare
+path.  The leading slash matters: the server resolves the path
+against the reddit origin, so a stray \"//\" would be read as a host."
+  (let ((p (string-trim cmt)))
+    (cond
+     ;; A redd.it link only carries the post id.  Reddit resolves
+     ;; /comments/<id>.json without the subreddit or the slug.
+     ((string-match "\\`\\(?:https?://\\)?redd\\.it/\\([[:alnum:]]+\\)" p)
+      (format "comments/%s" (match-string 1 p)))
+     (t
+      (let* ((p (replace-regexp-in-string "\\`https?://[^/]+/" "" p))
+             (p (replace-regexp-in-string "[?#].*\\'" "" p))
+             (p (replace-regexp-in-string "\\`/+\\|/+\\'" "" p))
+             (p (replace-regexp-in-string "\\.json\\'" "" p)))
+        p)))))
 
 (defun reddigg--promise-comments (cmt)
   "Promise CMT list."
@@ -2375,11 +2416,23 @@ which registers the image area after the comments are inserted."
 ;;;###autoload
 (defun reddigg-view-comments (cmt)
   "Ask and print CMT to buffer.
-CMT may be a full reddit URL or a path like
-r/emacs/comments/lfww57/weekly_tipstricketc_thread/."
+CMT may be a full reddit URL (including a redd.it share link) or a
+path like r/emacs/comments/lfww57/weekly_tipstricketc_thread/."
   (interactive "sComment: ")
   ;; `reddigg--promise-comments' normalizes URLs/slashes itself.
   (reddigg--view-comments cmt))
+
+;;;###autoload
+(defun reddigg-open-url (url &rest _)
+  "Open URL, a link to a reddit post, in reddigg.
+URL may be a comment permalink such as
+https://www.reddit.com/r/emacs/comments/lfww57/title/ or a
+https://redd.it/ID share link.  Extra arguments are ignored, so the
+function can be used as a `browse-url-handlers' entry."
+  (interactive "sReddit post URL: ")
+  (unless (reddigg-reddit-post-url-p url)
+    (user-error "reddigg: not a reddit post link: %s" url))
+  (reddigg--view-comments url))
 
 (defun reddigg--view-comments (cmt &optional new-window)
   "Ask and print CMT to buffer. When NEW-WINDOW will show in new buffer."
@@ -2466,6 +2519,32 @@ SCOPE: hour, day, week, year, all."
                             (insert (format reddigg--template-sub sub sub)))
                           (reddigg--ensure-modes)
                           reddigg--main-buffer))))
+
+;;; --- browse-url integration -----------------------------------------------
+;;
+;; Opening a reddit post link -- from an org buffer, eww, a shell or
+;; anywhere else that goes through `browse-url' -- shows it in the
+;; reddigg comments buffer instead of a web browser.  The autoloaded
+;; form below registers the handler as soon as `browse-url' is
+;; available, even when reddigg itself is still deferred; its regexp
+;; must stay in sync with `reddigg--reddit-post-url-regexp'.
+
+(with-eval-after-load 'browse-url
+  (add-to-list 'browse-url-handlers
+               (cons reddigg--reddit-post-url-regexp #'reddigg-open-url)))
+
+;;;###autoload
+(with-eval-after-load 'browse-url
+  (add-to-list 'browse-url-handlers
+               (cons (concat "\\`https?://"
+                             "\\(?:"
+                             "redd\\.it/[[:alnum:]]+"
+                             "\\|"
+                             "\\(?:[[:alnum:]-]+\\.\\)*reddit\\.com/"
+                             "\\(?:r/[^/?#]+/\\)?comments/[[:alnum:]]+"
+                             "\\)"
+                             "\\(?:[/?#]\\|\\'\\)")
+                     #'reddigg-open-url)))
 
 (provide 'reddigg)
 ;;; reddigg.el ends here

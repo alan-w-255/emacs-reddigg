@@ -170,6 +170,8 @@ The default is ~nil~; the arguments are placed before the video URL.
 
 ~reddigg-view-comments~ prompts for a post and shows its comments.
 
+~reddigg-open-url~ opens a full Reddit post link in reddigg.
+
 ~reddigg-submit-post~ starts a new post.
 
 ~reddigg-ping~ checks that the server is up and a Reddit tab is connected.
@@ -194,6 +196,23 @@ The default is ~nil~; the arguments are placed before the video URL.
 2. Select a subreddit.
 3. Select a post.
 4. Enter on ~view comments~ to open its comments.
+
+* Reddit links
+
+Reddit post links open in reddigg instead of a web browser, wherever
+they go through ~browse-url~: org links, eww, =M-x browse-url-at-point=,
+and so on. This works for comment permalinks such as
+=https://www.reddit.com/r/emacs/comments/lfww57/title/=
+(with or without the =www= or =old= subdomain, with tracking query
+strings, and with or without the title slug) as well as =https://redd.it/=
+share links.
+
+The handler is registered in ~browse-url-handlers~ as soon as the
+package is installed; reddigg itself is only loaded when you follow a
+matching link. To hand those links back to your browser, remove the
+entry pointing at ~reddigg-open-url~ from ~browse-url-handlers~.
+
+Run ~M-x reddigg-open-url~ to paste a link by hand.
 
 * Images
 
